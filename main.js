@@ -2,6 +2,8 @@ import { Account, Client, Databases } from 'node-appwrite';
 import { createCipheriv, randomBytes } from 'node:crypto';
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const SANDBOX_CALLBACK_PATH = '/oauth/sandbox/callback';
+const PRODUCTION_CALLBACK_PATH = '/oauth/production/callback';
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -20,15 +22,24 @@ function requiredEnv(name) {
   return value;
 }
 
-function loadConfig() {
-  const environment = requiredEnv('EBAY_ENVIRONMENT').toLowerCase();
+function normalizeEnvironment(value, source = 'eBay environment') {
+  const environment = String(value ?? '').trim().toLowerCase();
 
   if (environment !== 'sandbox' && environment !== 'production') {
-    throw new Error('EBAY_ENVIRONMENT must be either "sandbox" or "production".');
+    throw new Error(`${source} must be either "sandbox" or "production".`);
   }
 
+  return environment;
+}
+
+function defaultEnvironment() {
+  return normalizeEnvironment(requiredEnv('EBAY_ENVIRONMENT'), 'EBAY_ENVIRONMENT');
+}
+
+function loadConfig(environment = defaultEnvironment()) {
+  const resolvedEnvironment = normalizeEnvironment(environment);
   const credentialPrefix =
-    environment === 'sandbox' ? 'EBAY_SANDBOX' : 'EBAY_PRODUCTION';
+    resolvedEnvironment === 'sandbox' ? 'EBAY_SANDBOX' : 'EBAY_PRODUCTION';
 
   const tokenEncryptionKey = Buffer.from(
     requiredEnv('EBAY_TOKEN_ENCRYPTION_KEY'),
@@ -51,7 +62,7 @@ function loadConfig() {
   }
 
   return {
-    environment,
+    environment: resolvedEnvironment,
     clientId: requiredEnv(`${credentialPrefix}_CLIENT_ID`),
     clientSecret: requiredEnv(`${credentialPrefix}_CLIENT_SECRET`),
     ruName: requiredEnv(`${credentialPrefix}_RU_NAME`),
@@ -105,9 +116,22 @@ async function getAuthenticatedUserId(req) {
   }
 }
 
-function createState() {
-  // Starts with a letter and stays below Appwrite's 36-character document-ID limit.
-  return `s${randomBytes(24).toString('base64url')}`;
+function createState(environment) {
+  const marker = environment === 'sandbox' ? 's' : 'p';
+
+  // Two-character environment prefix + 32 random base64url characters stays
+  // below Appwrite's 36-character document-ID limit.
+  return `s${marker}${randomBytes(24).toString('base64url')}`;
+}
+
+function environmentFromState(state) {
+  if (typeof state !== 'string' || state.length < 3 || state[0] !== 's') {
+    return null;
+  }
+
+  if (state[1] === 's') return 'sandbox';
+  if (state[1] === 'p') return 'production';
+  return null;
 }
 
 function getQueryValue(req, key) {
@@ -118,6 +142,34 @@ function getQueryValue(req, key) {
   }
 
   return typeof value === 'string' ? value : '';
+}
+
+function getRequestPath(req) {
+  if (typeof req.path === 'string' && req.path) {
+    return new URL(req.path, 'https://keepflip.invalid').pathname;
+  }
+
+  if (typeof req.url === 'string' && req.url) {
+    return new URL(req.url, 'https://keepflip.invalid').pathname;
+  }
+
+  return '/';
+}
+
+function callbackEnvironmentFromPath(path) {
+  if (path === SANDBOX_CALLBACK_PATH) return 'sandbox';
+  if (path === PRODUCTION_CALLBACK_PATH) return 'production';
+  return null;
+}
+
+function requestedEnvironment(body) {
+  const requested = body?.environment;
+
+  if (requested === undefined || requested === null || requested === '') {
+    return defaultEnvironment();
+  }
+
+  return normalizeEnvironment(requested, 'OAuth start environment');
 }
 
 function getAuthorizationEndpoint(environment) {
@@ -339,6 +391,7 @@ function resultPage(status, appUrl) {
 function returnToApp(res, config, status, statusCode = 200) {
   const appUrl = new URL(config.appReturnUrl);
   appUrl.searchParams.set('ebay', status);
+  appUrl.searchParams.set('ebayEnvironment', config.environment);
 
   return res.text(resultPage(status, appUrl.toString()), statusCode, {
     'content-type': 'text/html; charset=utf-8',
@@ -351,7 +404,7 @@ function returnToApp(res, config, status, statusCode = 200) {
 
 async function handleStart({ req, res, databases, config }) {
   const userId = await getAuthenticatedUserId(req);
-  const state = createState();
+  const state = createState(config.environment);
 
   await databases.createDocument({
     databaseId: config.databaseId,
@@ -365,6 +418,7 @@ async function handleStart({ req, res, databases, config }) {
   });
 
   return res.json({
+    environment: config.environment,
     authorizationUrl: buildAuthorizationUrl(config, state),
   });
 }
@@ -397,7 +451,7 @@ async function handleStatus({ req, res, databases, config }) {
 async function handleCallback({ req, res, log, error, databases, config }) {
   const state = getQueryValue(req, 'state');
 
-  if (!state) {
+  if (!state || environmentFromState(state) !== config.environment) {
     return returnToApp(res, config, 'invalid', 400);
   }
 
@@ -437,7 +491,7 @@ async function handleCallback({ req, res, log, error, databases, config }) {
   const oauthError = getQueryValue(req, 'error');
 
   if (oauthError) {
-    log('eBay OAuth was cancelled or declined by the user.');
+    log(`eBay ${config.environment} OAuth was cancelled or declined by the user.`);
     return returnToApp(res, config, 'declined');
   }
 
@@ -460,7 +514,7 @@ async function handleCallback({ req, res, log, error, databases, config }) {
     return returnToApp(res, config, 'connected');
   } catch (caughtError) {
     error(
-      `eBay OAuth callback failed: ${caughtError?.name ?? 'unknown error'}`,
+      `eBay ${config.environment} OAuth callback failed: ${caughtError?.name ?? 'unknown error'}: ${caughtError?.message ?? 'no message'}`,
     );
 
     return returnToApp(res, config, 'error', 502);
@@ -471,10 +525,18 @@ export default async ({ req, res, log, error }) => {
   let config;
 
   try {
-    config = loadConfig();
     const databases = createAdminDatabases(req);
+    const requestPath = getRequestPath(req);
 
     if (req.method === 'GET') {
+      const callbackEnvironment = callbackEnvironmentFromPath(requestPath);
+
+      if (!callbackEnvironment) {
+        return res.json({ error: 'OAuth callback route not found.' }, 404);
+      }
+
+      config = loadConfig(callbackEnvironment);
+
       return handleCallback({
         req,
         res,
@@ -493,10 +555,12 @@ export default async ({ req, res, log, error }) => {
     const action = body?.action;
 
     if (action === 'start') {
+      config = loadConfig(requestedEnvironment(body));
       return handleStart({ req, res, databases, config });
     }
 
     if (action === 'status') {
+      config = loadConfig(defaultEnvironment());
       return handleStatus({ req, res, databases, config });
     }
 
@@ -506,7 +570,7 @@ export default async ({ req, res, log, error }) => {
     );
   } catch (caughtError) {
     error(
-      `eBay OAuth function failed: ${caughtError?.name ?? 'unknown error'}`,
+      `eBay OAuth function failed: ${caughtError?.name ?? 'unknown error'}: ${caughtError?.message ?? 'no message'}`,
     );
 
     if (req.method === 'GET' && config) {
