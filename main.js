@@ -27,6 +27,9 @@ function loadConfig() {
     throw new Error('EBAY_ENVIRONMENT must be either "sandbox" or "production".');
   }
 
+  const credentialPrefix =
+    environment === 'sandbox' ? 'EBAY_SANDBOX' : 'EBAY_PRODUCTION';
+
   const tokenEncryptionKey = Buffer.from(
     requiredEnv('EBAY_TOKEN_ENCRYPTION_KEY'),
     'base64',
@@ -49,9 +52,9 @@ function loadConfig() {
 
   return {
     environment,
-    clientId: requiredEnv('EBAY_CLIENT_ID'),
-    clientSecret: requiredEnv('EBAY_CLIENT_SECRET'),
-    ruName: requiredEnv('EBAY_RU_NAME'),
+    clientId: requiredEnv(`${credentialPrefix}_CLIENT_ID`),
+    clientSecret: requiredEnv(`${credentialPrefix}_CLIENT_SECRET`),
+    ruName: requiredEnv(`${credentialPrefix}_RU_NAME`),
     scopes,
     appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
     tokenEncryptionKey,
