@@ -450,6 +450,15 @@ async function handleStatus({ req, res, databases, config }) {
 
 async function handleCallback({ req, res, log, error, databases, config }) {
   const state = getQueryValue(req, 'state');
+  const code = getQueryValue(req, 'code');
+  const oauthError = getQueryValue(req, 'error');
+
+  // eBay documents state as being returned to the accepted URL. A declined
+  // redirect is therefore allowed to arrive without a state value.
+  if (oauthError || !code) {
+    log(`eBay ${config.environment} OAuth was cancelled or declined by the user.`);
+    return returnToApp(res, config, 'declined');
+  }
 
   if (!state || environmentFromState(state) !== config.environment) {
     return returnToApp(res, config, 'invalid', 400);
@@ -487,19 +496,6 @@ async function handleCallback({ req, res, log, error, databases, config }) {
       usedAt: new Date().toISOString(),
     },
   });
-
-  const oauthError = getQueryValue(req, 'error');
-
-  if (oauthError) {
-    log(`eBay ${config.environment} OAuth was cancelled or declined by the user.`);
-    return returnToApp(res, config, 'declined');
-  }
-
-  const code = getQueryValue(req, 'code');
-
-  if (!code) {
-    return returnToApp(res, config, 'error', 400);
-  }
 
   try {
     const tokenResponse = await exchangeAuthorizationCode(config, code);
