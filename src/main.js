@@ -93,38 +93,52 @@ function stateSecret() {
 
 function loadConfig(environment) {
     const normalized = normalizeEnvironment(environment);
-
+  
     const prefix =
-        normalized === 'sandbox'
-            ? 'EBAY_SANDBOX'
-            : 'EBAY_PRODUCTION';
-
+      normalized === 'sandbox'
+        ? 'EBAY_SANDBOX'
+        : 'EBAY_PRODUCTION';
+  
     return {
-        environment: normalized,
-        ebayEnvironment: ebayEnvironmentName(normalized),
-
-        clientId: requiredEnv(`${prefix}_CLIENT_ID`),
-        clientSecret: requiredEnv(`${prefix}_CLIENT_SECRET`),
-        ruName: requiredEnv(`${prefix}_RU_NAME`),
-
-        scopes: scopesFromEnvironmentVariable(
-            `${prefix}_SCOPES`,
+      environment: normalized,
+  
+      ebayEnvironment:
+        ebayEnvironmentName(normalized),
+  
+      clientId:
+        requiredEnv(`${prefix}_CLIENT_ID`),
+  
+      clientSecret:
+        requiredEnv(`${prefix}_CLIENT_SECRET`),
+  
+      ruName:
+        requiredEnv(`${prefix}_RU_NAME`),
+  
+      scopes:
+        scopesFromEnvironmentVariable(
+          'EBAY_OAUTH_SCOPES',
         ),
-
-        appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
-
-        databaseId: requiredEnv(
-            'APPWRITE_EBAY_DATABASE_ID',
+  
+      appReturnUrl:
+        requiredEnv('EBAY_APP_RETURN_URL'),
+  
+      databaseId:
+        requiredEnv(
+          'APPWRITE_EBAY_DATABASE_ID',
         ),
-
-        connectionsCollectionId: requiredEnv(
-            'APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID',
+  
+      connectionsCollectionId:
+        requiredEnv(
+          'APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID',
         ),
-
-        encryptionKey: tokenEncryptionKey(),
-        stateSecret: stateSecret(),
+  
+      encryptionKey:
+        tokenEncryptionKey(),
+  
+      stateSecret:
+        stateSecret(),
     };
-}
+  }
 
 function createEbayClient(config) {
     return new EbayAuthToken({
