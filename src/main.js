@@ -1166,7 +1166,7 @@ export default async function main({
         if (
             req.method === 'GET' &&
             path ===
-            SANDBOX_CALLBACK_PATH
+            EBAY_CALLBACK_PATH
         ) {
             return await handleCallback({
                 req,
