@@ -886,7 +886,8 @@ async function refreshStoredConnection({
 function fallbackAppReturnUrl(status) {
     const url =
         new URL(
-            requiredEnv('EBAY_APP_RETURN_URL'),
+            process.env.EBAY_APP_RETURN_URL?.trim() ||
+                'keepflip://ebay/connected',
         );
 
     url.searchParams.set(
