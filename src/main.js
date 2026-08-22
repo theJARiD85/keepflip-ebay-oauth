@@ -176,7 +176,9 @@ function requestHeader(headers, name) {
 }
 
 function createAdminDatabases(req) {
-    const apiKey = requestHeader(req?.headers, 'x-appwrite-key');
+    const apiKey =
+        requestHeader(req?.headers, 'x-appwrite-key') ||
+        cleanText(process.env.APPWRITE_FUNCTION_API_KEY);
 
     if (!apiKey) {
         throw new Error(
