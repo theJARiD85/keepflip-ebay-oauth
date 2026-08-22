@@ -117,22 +117,31 @@ function loadConfig(environment) {
 
         clientId: requiredEnv(`${prefix}_CLIENT_ID`),
         clientSecret: requiredEnv(`${prefix}_CLIENT_SECRET`),
-        ruName: requiredEnv(`${prefix}_RU_NAME`),
+        ruName:
+            process.env[`${prefix}_RU_NAME`]?.trim() ||
+            process.env[`${prefix}_RUNAME`]?.trim() ||
+            requiredEnv(`${prefix}_RU_NAME`),
 
         // The eBay keysets share one approved scope list in Appwrite.
         // Environment selection still controls credentials, RuName, and
         // endpoint; scopes remain the single EBAY_OAUTH_SCOPES variable.
         scopes: scopesFromEnvironmentVariable('EBAY_OAUTH_SCOPES'),
 
-        appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
+        // These defaults preserve the identifiers used by the original
+        // URL-serving ebay_oauth Function while allowing explicit overrides.
+        appReturnUrl:
+            process.env.EBAY_APP_RETURN_URL?.trim() ||
+            'keepflip://ebay/connected',
 
-        databaseId: requiredEnv(
-            'APPWRITE_EBAY_DATABASE_ID',
-        ),
+        databaseId:
+            process.env.APPWRITE_EBAY_DATABASE_ID?.trim() ||
+            process.env.APPWRITE_DATABASE_ID?.trim() ||
+            'keepflip',
 
-        connectionsCollectionId: requiredEnv(
-            'APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID',
-        ),
+        connectionsCollectionId:
+            process.env.APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_CONNECTIONS_COLLECTION_ID?.trim() ||
+            'ebay_connections',
 
         encryptionKey: tokenEncryptionKey(),
         stateSecret: stateSecret(),
