@@ -148,8 +148,26 @@ function createEbayClient(config) {
     });
 }
 
+function requestHeader(headers, name) {
+    if (!headers || typeof headers !== 'object') return '';
+
+    if (typeof headers.get === 'function') {
+        const value = headers.get(name);
+        if (value) return cleanText(value);
+    }
+
+    const expected = name.toLowerCase();
+
+    for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() !== expected) continue;
+        return cleanText(Array.isArray(value) ? value[0] : value);
+    }
+
+    return '';
+}
+
 function createAdminDatabases(req) {
-    const apiKey = req.headers['x-appwrite-key'];
+    const apiKey = requestHeader(req?.headers, 'x-appwrite-key');
 
     if (!apiKey) {
         throw new Error(
@@ -1234,6 +1252,39 @@ export default async function main({
                 flow:
                     'authorization_code',
             });
+        }
+
+        const callbackRequest =
+            req.method === 'GET' &&
+            (
+                path === EBAY_CALLBACK_PATH ||
+                path === LEGACY_EBAY_CALLBACK_PATH ||
+                path === EBAY_DECLINED_PATH ||
+                path === LEGACY_EBAY_DECLINED_PATH
+            );
+
+        const hasLegacyAuthCallbackParameters =
+            callbackRequest &&
+            (
+                queryValue(req, 'ebaytkn') ||
+                queryValue(req, 'tknexp') ||
+                queryValue(req, 'username')
+            );
+
+        if (hasLegacyAuthCallbackParameters) {
+            error(
+                "eBay returned the legacy Auth'n'Auth callback parameters. " +
+                    'That flow does not provide an OAuth 2 authorization code or refresh token.',
+            );
+
+            return res.json(
+                {
+                    error:
+                        "eBay returned legacy Auth'n'Auth parameters. " +
+                        'Restart the OAuth 2 authorization-code flow so eBay returns code and state.',
+                },
+                400,
+            );
         }
 
         const databases =
