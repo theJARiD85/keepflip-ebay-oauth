@@ -238,17 +238,40 @@ function expiryIso(seconds, fieldName) {
   return new Date(Date.now() + numeric * 1000).toISOString();
 }
 
-function parseTokenResponse(raw, operation) {
+function tokenEndpoint(environment) {
+  return environment === 'production'
+    ? 'https://api.ebay.com/identity/v1/oauth2/token'
+    : 'https://api.sandbox.ebay.com/identity/v1/oauth2/token';
+}
+
+async function postTokenRequest(config, form, operation) {
+  const basicCredentials = Buffer.from(
+    `${config.clientId}:${config.clientSecret}`,
+    'utf8',
+  ).toString('base64');
+
+  const response = await fetch(tokenEndpoint(config.environment), {
+    method: 'POST',
+    headers: {
+      authorization: `Basic ${basicCredentials}`,
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: form.toString(),
+  });
+
   let payload;
   try {
-    payload = JSON.parse(raw);
+    payload = await response.json();
   } catch {
     throw new Error(`eBay returned a non-JSON response during ${operation}.`);
   }
 
-  if (payload?.error) {
-    const description = payload.error_description ? `: ${payload.error_description}` : '';
-    throw new Error(`eBay OAuth ${operation} failed (${payload.error}${description}).`);
+  if (!response.ok || payload?.error) {
+    const providerError = payload?.error || `HTTP ${response.status}`;
+    const description = payload?.error_description
+      ? `: ${payload.error_description}`
+      : '';
+    throw new Error(`eBay OAuth ${operation} failed (${providerError}${description}).`);
   }
 
   if (!payload?.access_token || !payload?.expires_in) {
@@ -259,31 +282,33 @@ function parseTokenResponse(raw, operation) {
 }
 
 async function exchangeAuthorizationCode(config, authorizationCode) {
-  const ebay = createEbayClient(config);
+  // req.query has already URL-decoded eBay's returned authorization code.
+  // URLSearchParams safely form-encodes it for the exact KB 5075 Step 2 request.
+  const form = new URLSearchParams();
+  form.set('grant_type', 'authorization_code');
+  form.set('code', authorizationCode);
+  form.set('redirect_uri', config.ruName);
 
-  // Appwrite parses the callback query string, so authorizationCode is URL-decoded here.
-  // ebay-oauth-nodejs-client builds the form body itself without encoding this value,
-  // therefore encode it once before handing it to the library. This follows eBay KB 5075.
-  const raw = await ebay.exchangeCodeForAccessToken(
-    config.ebayEnvironment,
-    encodeURIComponent(authorizationCode),
+  const payload = await postTokenRequest(
+    config,
+    form,
+    'authorization-code exchange',
   );
 
-  const payload = parseTokenResponse(raw, 'authorization-code exchange');
   if (!payload.refresh_token || !payload.refresh_token_expires_in) {
     throw new Error('eBay did not return the refresh token required for a user connection.');
   }
+
   return payload;
 }
 
 async function exchangeRefreshToken(config, refreshToken) {
-  const ebay = createEbayClient(config);
-  const raw = await ebay.getAccessToken(
-    config.ebayEnvironment,
-    encodeURIComponent(refreshToken),
-    config.scopes,
-  );
-  return parseTokenResponse(raw, 'refresh-token exchange');
+  // KB 5075 Step 3: refresh request contains grant_type + refresh_token.
+  const form = new URLSearchParams();
+  form.set('grant_type', 'refresh_token');
+  form.set('refresh_token', refreshToken);
+
+  return postTokenRequest(config, form, 'refresh-token exchange');
 }
 
 async function saveNewConnection({ databases, config, userId, tokenResponse }) {
