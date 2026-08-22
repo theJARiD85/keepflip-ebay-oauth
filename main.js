@@ -44,14 +44,14 @@ function ebayEnvironmentName(environment) {
   return environment === 'production' ? 'PRODUCTION' : 'SANDBOX';
 }
 
-function scopesFromEnvironment() {
-  const scopes = requiredEnv('EBAY_SCOPES')
+function scopesFromEnvironmentVariable(name) {
+  const scopes = requiredEnv(name)
     .split(/\s+/)
     .map((scope) => scope.trim())
     .filter(Boolean);
 
   if (scopes.length === 0) {
-    throw new Error('EBAY_SCOPES must contain at least one eBay OAuth scope.');
+    throw new Error(`${name} must contain at least one eBay OAuth scope.`);
   }
 
   return scopes;
@@ -83,7 +83,7 @@ function loadConfig(environment) {
     clientId: requiredEnv(`${prefix}_CLIENT_ID`),
     clientSecret: requiredEnv(`${prefix}_CLIENT_SECRET`),
     ruName: requiredEnv(`${prefix}_RU_NAME`),
-    scopes: scopesFromEnvironment(),
+    scopes: scopesFromEnvironmentVariable(`${prefix}_SCOPES`),
     appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
     databaseId: requiredEnv('APPWRITE_EBAY_DATABASE_ID'),
     connectionsCollectionId: requiredEnv('APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID'),
