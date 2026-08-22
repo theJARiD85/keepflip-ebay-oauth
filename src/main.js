@@ -13,8 +13,12 @@ const require = createRequire(import.meta.url);
 const EbayAuthToken = require('ebay-oauth-nodejs-client');
 
 const STATE_TTL_MS = 10 * 60 * 1000;
-const EBAY_CALLBACK_PATH = '/oauth/callback';
-const EBAY_DECLINED_PATH = '/oauth/declined';
+const EBAY_CALLBACK_PATH = '/oauth/ebay/callback';
+const EBAY_DECLINED_PATH = '/oauth/ebay/declined';
+// Keep the earlier portal routes working while the eBay developer portal
+// finishes moving to the shared /oauth/ebay/* callback paths.
+const LEGACY_EBAY_CALLBACK_PATH = '/oauth/callback';
+const LEGACY_EBAY_DECLINED_PATH = '/oauth/declined';
 
 class HttpError extends Error {
     constructor(status, message) {
@@ -30,6 +34,14 @@ function requiredEnv(name) {
         throw new Error(`Missing required environment variable: ${name}`);
     }
     return value;
+}
+
+function cleanText(value, maxLength = 8_000) {
+    if (typeof value !== 'string') return '';
+    const cleaned = value.trim();
+    return cleaned.length <= maxLength
+        ? cleaned
+        : cleaned.slice(0, maxLength);
 }
 
 function normalizeEnvironment(value, label = 'environment') {
@@ -93,52 +105,39 @@ function stateSecret() {
 
 function loadConfig(environment) {
     const normalized = normalizeEnvironment(environment);
-  
+
     const prefix =
-      normalized === 'sandbox'
-        ? 'EBAY_SANDBOX'
-        : 'EBAY_PRODUCTION';
-  
+        normalized === 'sandbox'
+            ? 'EBAY_SANDBOX'
+            : 'EBAY_PRODUCTION';
+
     return {
-      environment: normalized,
-  
-      ebayEnvironment:
-        ebayEnvironmentName(normalized),
-  
-      clientId:
-        requiredEnv(`${prefix}_CLIENT_ID`),
-  
-      clientSecret:
-        requiredEnv(`${prefix}_CLIENT_SECRET`),
-  
-      ruName:
-        requiredEnv(`${prefix}_RU_NAME`),
-  
-      scopes:
-        scopesFromEnvironmentVariable(
-          'EBAY_OAUTH_SCOPES',
+        environment: normalized,
+        ebayEnvironment: ebayEnvironmentName(normalized),
+
+        clientId: requiredEnv(`${prefix}_CLIENT_ID`),
+        clientSecret: requiredEnv(`${prefix}_CLIENT_SECRET`),
+        ruName: requiredEnv(`${prefix}_RU_NAME`),
+
+        // The eBay keysets share one approved scope list in Appwrite.
+        // Environment selection still controls credentials, RuName, and
+        // endpoint; scopes remain the single EBAY_OAUTH_SCOPES variable.
+        scopes: scopesFromEnvironmentVariable('EBAY_OAUTH_SCOPES'),
+
+        appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
+
+        databaseId: requiredEnv(
+            'APPWRITE_EBAY_DATABASE_ID',
         ),
-  
-      appReturnUrl:
-        requiredEnv('EBAY_APP_RETURN_URL'),
-  
-      databaseId:
-        requiredEnv(
-          'APPWRITE_EBAY_DATABASE_ID',
+
+        connectionsCollectionId: requiredEnv(
+            'APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID',
         ),
-  
-      connectionsCollectionId:
-        requiredEnv(
-          'APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID',
-        ),
-  
-      encryptionKey:
-        tokenEncryptionKey(),
-  
-      stateSecret:
-        stateSecret(),
+
+        encryptionKey: tokenEncryptionKey(),
+        stateSecret: stateSecret(),
     };
-  }
+}
 
 function createEbayClient(config) {
     return new EbayAuthToken({
@@ -203,15 +202,37 @@ function requestBody(req) {
 }
 
 function queryValue(req, name) {
-    const value = req.query?.[name];
+    const values = [];
+    const parsedQuery = req?.query;
 
-    if (Array.isArray(value)) {
-        return String(value[0] ?? '');
+    if (parsedQuery && typeof parsedQuery === 'object' && !Array.isArray(parsedQuery)) {
+        values.push(parsedQuery[name]);
+    } else if (typeof parsedQuery === 'string') {
+        values.push(new URLSearchParams(parsedQuery).get(name));
     }
 
-    return value == null
-        ? ''
-        : String(value);
+    if (typeof req?.queryString === 'string') {
+        values.push(new URLSearchParams(req.queryString).get(name));
+    }
+
+    const requestUrl = cleanText(req?.url, 8_000);
+    if (requestUrl) {
+        try {
+            values.push(
+                new URL(requestUrl, 'https://keepflip.invalid').searchParams.get(name),
+            );
+        } catch {
+            // Use the other request representations when the URL is malformed.
+        }
+    }
+
+    for (const value of values) {
+        const first = Array.isArray(value) ? value[0] : value;
+        const cleaned = cleanText(first, 8_000);
+        if (cleaned) return cleaned;
+    }
+
+    return '';
 }
 
 function encodeState(payload, secret) {
@@ -252,7 +273,6 @@ function createState(
 
 function verifyState(
     state,
-    expectedEnvironment,
     secret,
 ) {
     if (
@@ -332,8 +352,7 @@ function verifyState(
         payload?.v !== 1 ||
         typeof payload.userId !== 'string' ||
         !payload.userId ||
-        payload.environment !==
-        expectedEnvironment ||
+        !['sandbox', 'production'].includes(payload.environment) ||
         !Number.isFinite(
             payload.expiresAt,
         ) ||
@@ -460,158 +479,249 @@ function expiryIso(
     ).toISOString();
 }
 
-function tokenEndpoint(environment) {
-    return environment ===
-        'production'
-        ? 'https://api.ebay.com/identity/v1/oauth2/token'
-        : 'https://api.sandbox.ebay.com/identity/v1/oauth2/token';
-}
-
-async function postTokenRequest(
-    config,
-    form,
-    operation,
+function requireTokenResponse(
+    payload,
+    requireRefreshToken = false,
 ) {
-    const basicCredentials =
-        Buffer.from(
-            `${config.clientId}:${config.clientSecret}`,
-            'utf8',
-        ).toString('base64');
+    let parsedPayload = payload;
 
-    const response =
-        await fetch(
-            tokenEndpoint(
-                config.environment,
-            ),
-            {
-                method: 'POST',
-
-                headers: {
-                    authorization:
-                        `Basic ${basicCredentials}`,
-
-                    'content-type':
-                        'application/x-www-form-urlencoded',
-                },
-
-                body:
-                    form.toString(),
-            },
-        );
-
-    let payload;
-
-    try {
-        payload =
-            await response.json();
-    } catch {
-        throw new Error(
-            `eBay returned a non-JSON response during ${operation}.`,
-        );
+    // The current official eBay Node client returns the token response body
+    // as a JSON string. Normalize it at this boundary so the rest of the
+    // function only handles the documented object shape.
+    if (typeof parsedPayload === 'string') {
+        try {
+            parsedPayload = JSON.parse(parsedPayload);
+        } catch {
+            throw new Error(
+                'eBay OAuth returned an invalid token response.',
+            );
+        }
     }
 
-    if (
-        !response.ok ||
-        payload?.error
-    ) {
-        const providerError =
-            payload?.error ||
-            `HTTP ${response.status}`;
-
+    if (parsedPayload?.error) {
         const description =
-            payload?.error_description
-                ? `: ${payload.error_description}`
-                : '';
+            parsedPayload.error_description ||
+            parsedPayload.error;
 
         throw new Error(
-            `eBay OAuth ${operation} failed (${providerError}${description}).`,
+            `eBay OAuth token request failed: ${description}`,
         );
     }
 
     if (
-        !payload?.access_token ||
-        !payload?.expires_in
+        !parsedPayload?.access_token ||
+        !Number.isFinite(Number(parsedPayload?.expires_in))
     ) {
         throw new Error(
-            `eBay OAuth ${operation} did not return a usable access token.`,
+            'eBay OAuth did not return a usable access token.',
         );
     }
 
-    return payload;
-}
-
-async function exchangeAuthorizationCode(
-    config,
-    authorizationCode,
-) {
-    // eBay KB 5075 Step 2:
-    // grant_type=authorization_code
-    // code=<authorization code>
-    // redirect_uri=<RuName>
-
-    const form =
-        new URLSearchParams();
-
-    form.set(
-        'grant_type',
-        'authorization_code',
-    );
-
-    form.set(
-        'code',
-        authorizationCode,
-    );
-
-    form.set(
-        'redirect_uri',
-        config.ruName,
-    );
-
-    const payload =
-        await postTokenRequest(
-            config,
-            form,
-            'authorization-code exchange',
-        );
-
     if (
-        !payload.refresh_token ||
-        !payload.refresh_token_expires_in
+        requireRefreshToken &&
+        (!parsedPayload.refresh_token ||
+            !Number.isFinite(Number(parsedPayload.refresh_token_expires_in)))
     ) {
         throw new Error(
             'eBay did not return the refresh token required for a user connection.',
         );
     }
 
-    return payload;
+    return parsedPayload;
+}
+
+async function exchangeAuthorizationCode(
+    config,
+    authorizationCode,
+) {
+    // eBay's official client implements KB 5075 Step 2.
+    const payload =
+        await createEbayClient(config).exchangeCodeForAccessToken(
+            config.ebayEnvironment,
+            authorizationCode,
+        );
+
+    return requireTokenResponse(
+        payload,
+        true,
+    );
 }
 
 async function exchangeRefreshToken(
     config,
     refreshToken,
 ) {
-    // eBay KB 5075 Step 3:
-    // grant_type=refresh_token
-    // refresh_token=<refresh token>
+    // eBay's official client implements KB 5075 Step 3.
+    const payload =
+        await createEbayClient(config).getAccessToken(
+            config.ebayEnvironment,
+            refreshToken,
+            config.scopes,
+        );
 
-    const form =
-        new URLSearchParams();
+    return requireTokenResponse(payload);
+}
 
-    form.set(
-        'grant_type',
-        'refresh_token',
+function ebayUserIdHmacKey() {
+    // Prefer the dedicated stable key. The state secret is a server-only
+    // fallback for existing deployments that have not added the dedicated key.
+    return (
+        cleanText(
+            process.env.EBAY_USER_ID_HMAC_KEY,
+            512,
+        ) || stateSecret()
+    );
+}
+
+function hashEbayUserId(ebayUserId) {
+    return createHmac(
+        'sha256',
+        ebayUserIdHmacKey(),
+    )
+        .update(
+            'keepflip|ebay-user-id|v1|' + ebayUserId,
+            'utf8',
+        )
+        .digest('hex');
+}
+
+function ebayIdentityEndpoint(environment) {
+    return environment === 'production'
+        ? 'https://api.ebay.com/commerce/identity/v1/user/'
+        : 'https://api.sandbox.ebay.com/commerce/identity/v1/user/';
+}
+
+async function getEbayIdentity(config, accessToken) {
+    let response;
+
+    try {
+        response = await fetch(
+            ebayIdentityEndpoint(config.environment),
+            {
+                method: 'GET',
+                headers: {
+                    Accept: 'application/json',
+                    Authorization: 'Bearer ' + accessToken,
+                },
+            },
+        );
+    } catch {
+        throw new Error(
+            'KeepFlip could not reach eBay Identity to identify the connected account.',
+        );
+    }
+
+    let payload = {};
+
+    try {
+        payload = JSON.parse(await response.text());
+    } catch {
+        payload = {};
+    }
+
+    if (!response.ok) {
+        throw new Error(
+            'eBay Identity rejected the connected account lookup.',
+        );
+    }
+
+    const ebayUserId = cleanText(
+        payload?.userId || payload?.userID,
+        255,
     );
 
-    form.set(
-        'refresh_token',
+    if (!ebayUserId) {
+        throw new Error(
+            'eBay Identity did not return a usable user ID.',
+        );
+    }
+
+    return {
+        userId: ebayUserId,
+        username:
+            cleanText(
+                payload?.username ||
+                    payload?.displayName ||
+                    ebayUserId,
+                255,
+            ) || ebayUserId,
+    };
+}
+
+function tokenBundleFromResponse(
+    config,
+    tokenResponse,
+    previous = null,
+) {
+    const now = new Date().toISOString();
+    const refreshToken =
+        tokenResponse.refresh_token ||
+        previous?.refreshToken ||
+        '';
+    const refreshTokenExpiresAt =
+        tokenResponse.refresh_token_expires_in
+            ? expiryIso(
+                  tokenResponse.refresh_token_expires_in,
+                  'refresh token expiry',
+              )
+            : previous?.refreshTokenExpiresAt || '';
+
+    if (!refreshToken || !refreshTokenExpiresAt) {
+        throw new Error(
+            'eBay did not return the refresh token required for a user connection.',
+        );
+    }
+
+    return {
+        version: 1,
+        environment: config.environment,
+        accessToken: tokenResponse.access_token,
+        accessTokenExpiresAt: expiryIso(
+            tokenResponse.expires_in,
+            'access token expiry',
+        ),
         refreshToken,
-    );
+        refreshTokenExpiresAt,
+        scopeList: config.scopes.join(' '),
+        tokenType: String(
+            tokenResponse.token_type ||
+                previous?.tokenType ||
+                'User Access Token',
+        ),
+        connectedAt: previous?.connectedAt || now,
+        updatedAt: now,
+    };
+}
 
-    return postTokenRequest(
-        config,
-        form,
-        'refresh-token exchange',
-    );
+function readTokenBundle(connection, config) {
+    let parsed;
+
+    try {
+        parsed = JSON.parse(
+            decryptSecret(
+                connection?.encryptedTokens,
+                config.encryptionKey,
+            ),
+        );
+    } catch {
+        throw new Error(
+            'Stored eBay token data is unreadable.',
+        );
+    }
+
+    if (
+        !parsed ||
+        typeof parsed.accessToken !== 'string' ||
+        typeof parsed.refreshToken !== 'string' ||
+        typeof parsed.accessTokenExpiresAt !== 'string' ||
+        typeof parsed.refreshTokenExpiresAt !== 'string'
+    ) {
+        throw new Error(
+            'Stored eBay token data is incomplete.',
+        );
+    }
+
+    return parsed;
 }
 
 async function saveNewConnection({
@@ -619,71 +729,40 @@ async function saveNewConnection({
     config,
     userId,
     tokenResponse,
+    ebayIdentity,
 }) {
-    const now =
-        new Date().toISOString();
-
-    const documentId =
-        connectionDocumentId(
-            userId,
-            config.environment,
-        );
-
-    const accessTokenExpiresAt =
-        expiryIso(
-            tokenResponse.expires_in,
-            'access token expiry',
-        );
+    const tokenBundle = tokenBundleFromResponse(
+        config,
+        tokenResponse,
+    );
 
     await databases.upsertDocument({
         databaseId:
             config.databaseId,
-
         collectionId:
             config.connectionsCollectionId,
-
-        documentId,
-
-        data: {
-            userId,
-
-            environment:
+        documentId:
+            connectionDocumentId(
+                userId,
                 config.environment,
-
-            accessTokenCiphertext:
-                encryptSecret(
-                    tokenResponse.access_token,
-                    config.encryptionKey,
-                ),
-
-            accessTokenExpiresAt,
-
-            refreshTokenCiphertext:
-                encryptSecret(
-                    tokenResponse.refresh_token,
-                    config.encryptionKey,
-                ),
-
-            refreshTokenExpiresAt:
-                expiryIso(
-                    tokenResponse.refresh_token_expires_in,
-                    'refresh token expiry',
-                ),
-
-            scopeList:
-                config.scopes.join(' '),
-
-            tokenType:
-                String(
-                    tokenResponse.token_type ||
-                    'User Access Token',
-                ),
-
-            isActive: true,
-
-            connectedAt: now,
-
-            updatedAt: now,
+            ),
+        data: {
+            ownerId: userId,
+            hashedEbayId: hashEbayUserId(
+                ebayIdentity.userId,
+            ),
+            encryptedTokens: encryptSecret(
+                JSON.stringify(tokenBundle),
+                config.encryptionKey,
+            ),
+            ebayUsername:
+                cleanText(
+                    ebayIdentity.username ||
+                        ebayIdentity.userId,
+                    255,
+                ) || ebayIdentity.userId,
+            revokedAt: null,
+            updatedAt: tokenBundle.updatedAt,
         },
     });
 }
@@ -703,17 +782,12 @@ async function getConnection(
         return await databases.getDocument({
             databaseId:
                 config.databaseId,
-
             collectionId:
                 config.connectionsCollectionId,
-
             documentId,
         });
     } catch (caught) {
-        if (
-            Number(caught?.code) ===
-            404
-        ) {
+        if (Number(caught?.code) === 404) {
             return null;
         }
 
@@ -726,16 +800,17 @@ async function refreshStoredConnection({
     config,
     connection,
 }) {
-    const refreshExpiry =
-        Date.parse(
-            connection.refreshTokenExpiresAt ||
-            '',
-        );
+    const storedTokens = readTokenBundle(
+        connection,
+        config,
+    );
+
+    const refreshExpiry = Date.parse(
+        storedTokens.refreshTokenExpiresAt || '',
+    );
 
     if (
-        !Number.isFinite(
-            refreshExpiry,
-        ) ||
+        !Number.isFinite(refreshExpiry) ||
         refreshExpiry <= Date.now()
     ) {
         throw new HttpError(
@@ -744,63 +819,53 @@ async function refreshStoredConnection({
         );
     }
 
-    const refreshToken =
-        decryptSecret(
-            connection.refreshTokenCiphertext,
-            config.encryptionKey,
-        );
+    const tokenResponse = await exchangeRefreshToken(
+        config,
+        storedTokens.refreshToken,
+    );
 
-    const tokenResponse =
-        await exchangeRefreshToken(
-            config,
-            refreshToken,
-        );
-
-    const now =
-        new Date().toISOString();
-
-    const accessTokenExpiresAt =
-        expiryIso(
-            tokenResponse.expires_in,
-            'access token expiry',
-        );
+    const tokenBundle = tokenBundleFromResponse(
+        config,
+        tokenResponse,
+        storedTokens,
+    );
 
     await databases.updateDocument({
         databaseId:
             config.databaseId,
-
         collectionId:
             config.connectionsCollectionId,
-
         documentId:
             connection.$id,
-
         data: {
-            accessTokenCiphertext:
-                encryptSecret(
-                    tokenResponse.access_token,
-                    config.encryptionKey,
-                ),
-
-            accessTokenExpiresAt,
-
-            tokenType:
-                String(
-                    tokenResponse.token_type ||
-                    connection.tokenType ||
-                    'User Access Token',
-                ),
-
-            isActive: true,
-
-            updatedAt: now,
+            encryptedTokens: encryptSecret(
+                JSON.stringify(tokenBundle),
+                config.encryptionKey,
+            ),
+            revokedAt: null,
+            updatedAt: tokenBundle.updatedAt,
         },
     });
 
     return {
-        accessTokenExpiresAt,
-        updatedAt: now,
+        accessTokenExpiresAt:
+            tokenBundle.accessTokenExpiresAt,
+        updatedAt: tokenBundle.updatedAt,
     };
+}
+
+function fallbackAppReturnUrl(status) {
+    const url =
+        new URL(
+            requiredEnv('EBAY_APP_RETURN_URL'),
+        );
+
+    url.searchParams.set(
+        'status',
+        status,
+    );
+
+    return url.toString();
 }
 
 function appReturnUrl(
@@ -832,39 +897,23 @@ async function handleConnect({
     const userId =
         authenticatedUserId(req);
 
-    const body =
-        requestBody(req);
-
     const environment =
         normalizeEnvironment(
-            body.environment,
+            requestBody(req).environment,
             'OAuth environment',
         );
 
-    const config =
-        loadConfig(environment);
-
+    // The app owns the pre-generated eBay login URL. This endpoint only
+    // issues a signed, one-time state that binds the callback to this user.
     const state =
         createState(
             userId,
             environment,
-            config.stateSecret,
-        );
-
-    const ebay =
-        createEbayClient(config);
-
-    const authorizationUrl =
-        ebay.generateUserAuthorizationUrl(
-            config.ebayEnvironment,
-            config.scopes,
-            {
-                state,
-            },
+            stateSecret(),
         );
 
     return res.json({
-        authorizationUrl,
+        state,
         environment,
     });
 }
@@ -877,12 +926,9 @@ async function handleStatus({
     const userId =
         authenticatedUserId(req);
 
-    const body =
-        requestBody(req);
-
     const environment =
         normalizeEnvironment(
-            body.environment,
+            requestBody(req).environment,
             'OAuth environment',
         );
 
@@ -898,7 +944,7 @@ async function handleStatus({
 
     if (
         !connection ||
-        connection.isActive !== true
+        connection.revokedAt
     ) {
         return res.json({
             connected: false,
@@ -906,16 +952,31 @@ async function handleStatus({
         });
     }
 
+    let storedTokens;
+
+    try {
+        storedTokens =
+            readTokenBundle(
+                connection,
+                config,
+            );
+    } catch {
+        throw new HttpError(
+            500,
+            'KeepFlip could not read the stored eBay connection.',
+        );
+    }
+
     const accessExpiry =
         Date.parse(
-            connection.accessTokenExpiresAt ||
-            '',
+            storedTokens.accessTokenExpiresAt ||
+                '',
         );
 
     const refreshExpiry =
         Date.parse(
-            connection.refreshTokenExpiresAt ||
-            '',
+            storedTokens.refreshTokenExpiresAt ||
+                '',
         );
 
     const refreshExpired =
@@ -931,10 +992,10 @@ async function handleStatus({
         environment,
 
         accessTokenExpiresAt:
-            connection.accessTokenExpiresAt,
+            storedTokens.accessTokenExpiresAt,
 
         refreshTokenExpiresAt:
-            connection.refreshTokenExpiresAt,
+            storedTokens.refreshTokenExpiresAt,
 
         accessTokenExpired:
             !Number.isFinite(
@@ -955,12 +1016,9 @@ async function handleRefresh({
     const userId =
         authenticatedUserId(req);
 
-    const body =
-        requestBody(req);
-
     const environment =
         normalizeEnvironment(
-            body.environment,
+            requestBody(req).environment,
             'OAuth environment',
         );
 
@@ -976,7 +1034,7 @@ async function handleRefresh({
 
     if (
         !connection ||
-        connection.isActive !== true
+        connection.revokedAt
     ) {
         throw new HttpError(
             404,
@@ -1007,21 +1065,72 @@ async function handleCallback({
     log,
     error,
     databases,
-    environment,
+    declinedPath,
 }) {
-    const config =
-        loadConfig(environment);
-
-    const authorizationCode =
+    const legacyAuthToken =
         queryValue(
             req,
-            'code',
+            'ebaytkn',
         );
+
+    const legacyTokenExpiry =
+        queryValue(
+            req,
+            'tknexp',
+        );
+
+    const legacyUsername =
+        queryValue(
+            req,
+            'username',
+        );
+
+    if (
+        legacyAuthToken ||
+        legacyTokenExpiry ||
+        legacyUsername
+    ) {
+        error(
+            "eBay returned the legacy Auth'n'Auth callback parameters. " +
+                'That flow does not provide an OAuth 2 authorization code or refresh token.',
+        );
+
+        return res.redirect(
+            fallbackAppReturnUrl('error'),
+            302,
+        );
+    }
 
     const returnedState =
         queryValue(
             req,
             'state',
+        );
+
+    let state;
+    let config;
+
+    try {
+        state = verifyState(
+            returnedState,
+            stateSecret(),
+        );
+        config = loadConfig(state.environment);
+    } catch (caught) {
+        error(
+            `eBay OAuth callback state validation failed: ${caught?.message || String(caught)}`,
+        );
+
+        return res.redirect(
+            fallbackAppReturnUrl('error'),
+            302,
+        );
+    }
+
+    const authorizationCode =
+        queryValue(
+            req,
+            'code',
         );
 
     const providerError =
@@ -1037,13 +1146,14 @@ async function handleCallback({
         );
 
     if (
+        declinedPath ||
         providerError ||
         isAuthSuccessful ===
         'false' ||
         !authorizationCode
     ) {
         log(
-            `eBay ${environment} authorization was declined or returned without a code.`,
+            `eBay ${config.environment} authorization was declined or returned without a code.`,
         );
 
         return res.redirect(
@@ -1056,17 +1166,16 @@ async function handleCallback({
     }
 
     try {
-        const state =
-            verifyState(
-                returnedState,
-                environment,
-                config.stateSecret,
-            );
-
         const tokenResponse =
             await exchangeAuthorizationCode(
                 config,
                 authorizationCode,
+            );
+
+        const ebayIdentity =
+            await getEbayIdentity(
+                config,
+                tokenResponse.access_token,
             );
 
         await saveNewConnection({
@@ -1075,10 +1184,11 @@ async function handleCallback({
             userId:
                 state.userId,
             tokenResponse,
+            ebayIdentity,
         });
 
         log(
-            `eBay ${environment} account connected for KeepFlip user ${state.userId}.`,
+            `eBay ${config.environment} account connected for KeepFlip user ${state.userId}.`,
         );
 
         return res.redirect(
@@ -1090,9 +1200,7 @@ async function handleCallback({
         );
     } catch (caught) {
         error(
-            `eBay ${environment} OAuth callback failed: ${caught?.message ||
-            String(caught)
-            }`,
+            `eBay ${config.environment} OAuth callback failed: ${caught?.message || String(caught)}`,
         );
 
         return res.redirect(
@@ -1165,8 +1273,12 @@ export default async function main({
 
         if (
             req.method === 'GET' &&
-            path ===
-            EBAY_CALLBACK_PATH
+            (
+                path === EBAY_CALLBACK_PATH ||
+                path === LEGACY_EBAY_CALLBACK_PATH ||
+                path === EBAY_DECLINED_PATH ||
+                path === LEGACY_EBAY_DECLINED_PATH
+            )
         ) {
             return await handleCallback({
                 req,
@@ -1174,24 +1286,9 @@ export default async function main({
                 log,
                 error,
                 databases,
-                environment:
-                    'sandbox',
-            });
-        }
-
-        if (
-            req.method === 'GET' &&
-            path ===
-            PRODUCTION_CALLBACK_PATH
-        ) {
-            return await handleCallback({
-                req,
-                res,
-                log,
-                error,
-                databases,
-                environment:
-                    'production',
+                declinedPath:
+                    path === EBAY_DECLINED_PATH ||
+                    path === LEGACY_EBAY_DECLINED_PATH,
             });
         }
 
