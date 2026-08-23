@@ -1137,6 +1137,18 @@ async function handleCallback({
             'state',
         );
 
+    const stateFormat =
+        returnedState.length === 0
+            ? 'missing'
+            : returnedState.split('.').length === 2
+                ? 'signed'
+                : 'legacy';
+
+    log(
+        `eBay OAuth callback state received: ${stateFormat}; ` +
+            `length=${returnedState.length}.`,
+    );
+
     let state;
     let config;
 
