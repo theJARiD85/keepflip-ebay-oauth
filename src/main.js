@@ -1,4 +1,4 @@
-import { Client, Databases } from 'node-appwrite';
+import { Client, Databases, Query } from 'node-appwrite';
 import {
     createCipheriv,
     createDecipheriv,
@@ -15,10 +15,6 @@ const EbayAuthToken = require('ebay-oauth-nodejs-client');
 const STATE_TTL_MS = 10 * 60 * 1000;
 const EBAY_CALLBACK_PATH = '/oauth/ebay/callback';
 const EBAY_DECLINED_PATH = '/oauth/ebay/declined';
-// Keep the earlier portal routes working while the eBay developer portal
-// finishes moving to the shared /oauth/ebay/* callback paths.
-const LEGACY_EBAY_CALLBACK_PATH = '/oauth/callback';
-const LEGACY_EBAY_DECLINED_PATH = '/oauth/declined';
 
 class HttpError extends Error {
     constructor(status, message) {
@@ -142,6 +138,11 @@ function loadConfig(environment) {
             process.env.APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID?.trim() ||
             process.env.APPWRITE_CONNECTIONS_COLLECTION_ID?.trim() ||
             'ebay_connections',
+
+        oauthStatesCollectionId:
+            process.env.APPWRITE_EBAY_OAUTH_STATES_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_EBAY_STATES_COLLECTION_ID?.trim() ||
+            'ebay_oauth_states',
 
         encryptionKey: tokenEncryptionKey(),
         stateSecret: stateSecret(),
@@ -400,12 +401,43 @@ function connectionDocumentId(
     userId,
     environment,
 ) {
+    // Appwrite custom IDs may not start with "-" or "_". Prefix the
+    // deterministic hex digest to make every new connection ID valid.
+    return `e${
+        createHash('sha256')
+            .update(
+                `${userId}:${environment}`,
+                'utf8',
+            )
+            .digest('hex')
+            .slice(0, 35)
+    }`;
+}
+
+function legacyConnectionDocumentId(
+    userId,
+    environment,
+) {
     return createHash('sha256')
         .update(
             `${userId}:${environment}`,
             'utf8',
         )
         .digest('base64url')
+        .slice(0, 36);
+}
+
+function isAppwriteDocumentId(value) {
+    return /^[A-Za-z0-9][A-Za-z0-9._-]{0,35}$/.test(value);
+}
+
+function oauthStateDocumentId(state) {
+    return createHash('sha256')
+        .update(
+            `keepflip|ebay-oauth-state|v1|${state}`,
+            'utf8',
+        )
+        .digest('hex')
         .slice(0, 36);
 }
 
@@ -640,17 +672,42 @@ async function getEbayIdentity(config, accessToken) {
         );
     }
 
+    const responseText = await response.text();
     let payload = {};
 
     try {
-        payload = JSON.parse(await response.text());
+        payload = JSON.parse(responseText);
     } catch {
         payload = {};
     }
 
     if (!response.ok) {
+        const firstProviderError =
+            Array.isArray(payload?.errors) ? payload.errors[0] : null;
+        const providerErrorId = cleanText(
+            firstProviderError?.errorId ||
+                payload?.errorId ||
+                payload?.error,
+            80,
+        );
+        const providerMessage = cleanText(
+            firstProviderError?.message ||
+                firstProviderError?.longMessage ||
+                payload?.error_description ||
+                payload?.message,
+            300,
+        );
+        const providerDetail = [
+            providerErrorId,
+            providerMessage,
+        ]
+            .filter(Boolean)
+            .join(': ');
+
         throw new Error(
-            'eBay Identity rejected the connected account lookup.',
+            `eBay Identity rejected the connected account lookup (HTTP ${response.status}${
+                providerDetail ? `: ${providerDetail}` : ''
+            }).`,
         );
     }
 
@@ -724,11 +781,16 @@ function tokenBundleFromResponse(
 
 function readTokenBundle(connection, config) {
     let parsed;
+    const tokenCiphertext =
+        typeof connection?.tokenCiphertext === 'string' &&
+        connection.tokenCiphertext
+            ? connection.tokenCiphertext
+            : connection?.encryptedTokens;
 
     try {
         parsed = JSON.parse(
             decryptSecret(
-                connection?.encryptedTokens,
+                tokenCiphertext,
                 config.encryptionKey,
             ),
         );
@@ -764,32 +826,42 @@ async function saveNewConnection({
         config,
         tokenResponse,
     );
+    const existingConnection =
+        await getConnection(
+            databases,
+            config,
+            userId,
+        );
+    const documentId =
+        existingConnection?.$id ||
+        connectionDocumentId(
+            userId,
+            config.environment,
+        );
 
     await databases.upsertDocument({
         databaseId:
             config.databaseId,
         collectionId:
             config.connectionsCollectionId,
-        documentId:
-            connectionDocumentId(
-                userId,
-                config.environment,
-            ),
+        documentId,
         data: {
             ownerId: userId,
-            hashedEbayId: hashEbayUserId(
+            environment: config.environment,
+            ebayUserIdHmac: hashEbayUserId(
                 ebayIdentity.userId,
             ),
-            encryptedTokens: encryptSecret(
+            status: 'active',
+            tokenCiphertext: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            ebayUsername:
-                cleanText(
-                    ebayIdentity.username ||
-                        ebayIdentity.userId,
-                    255,
-                ) || ebayIdentity.userId,
+            accessTokenExpiresAt:
+                tokenBundle.accessTokenExpiresAt,
+            refreshTokenExpiresAt:
+                tokenBundle.refreshTokenExpiresAt,
+            scopeText: tokenBundle.scopeList,
+            createdAt: tokenBundle.connectedAt,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -801,27 +873,46 @@ async function getConnection(
     config,
     userId,
 ) {
-    const documentId =
+    const currentDocumentId =
         connectionDocumentId(
             userId,
             config.environment,
         );
+    const legacyDocumentId =
+        legacyConnectionDocumentId(
+            userId,
+            config.environment,
+        );
+    const documentIds = [
+        currentDocumentId,
+    ];
 
-    try {
-        return await databases.getDocument({
-            databaseId:
-                config.databaseId,
-            collectionId:
-                config.connectionsCollectionId,
-            documentId,
-        });
-    } catch (caught) {
-        if (Number(caught?.code) === 404) {
-            return null;
-        }
-
-        throw caught;
+    if (
+        legacyDocumentId !== currentDocumentId &&
+        isAppwriteDocumentId(legacyDocumentId)
+    ) {
+        documentIds.push(legacyDocumentId);
     }
+
+    for (const documentId of documentIds) {
+        try {
+            return await databases.getDocument({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.connectionsCollectionId,
+                documentId,
+            });
+        } catch (caught) {
+            if (Number(caught?.code) === 404) {
+                continue;
+            }
+
+            throw caught;
+        }
+    }
+
+    return null;
 }
 
 async function refreshStoredConnection({
@@ -867,10 +958,16 @@ async function refreshStoredConnection({
         documentId:
             connection.$id,
         data: {
-            encryptedTokens: encryptSecret(
+            status: 'active',
+            tokenCiphertext: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
+            accessTokenExpiresAt:
+                tokenBundle.accessTokenExpiresAt,
+            refreshTokenExpiresAt:
+                tokenBundle.refreshTokenExpiresAt,
+            scopeText: tokenBundle.scopeList,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -918,6 +1015,142 @@ function appReturnUrl(
     );
 
     return url.toString();
+}
+
+async function claimOAuthState({
+    databases,
+    config,
+    state,
+    payload,
+}) {
+    const documentId =
+        oauthStateDocumentId(state);
+
+    let record;
+
+    try {
+        record =
+            await databases.getDocument({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.oauthStatesCollectionId,
+                documentId,
+            });
+    } catch (caught) {
+        if (Number(caught?.code) === 404) {
+            throw new HttpError(
+                400,
+                'The eBay OAuth state is missing or invalid.',
+            );
+        }
+
+        throw new Error(
+            'KeepFlip could not read the eBay OAuth state.',
+        );
+    }
+
+    const expiresAt =
+        Date.parse(
+            String(record?.expiresAt || ''),
+        );
+
+    if (
+        record?.ownerId !== payload.userId ||
+        record?.environment !== payload.environment ||
+        record?.status !== 'pending' ||
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= Date.now()
+    ) {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state has expired, was already used, or does not match this callback.',
+        );
+    }
+
+    const claimedAt =
+        new Date().toISOString();
+
+    let updateResponse;
+
+    try {
+        updateResponse =
+            await databases.updateDocuments({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.oauthStatesCollectionId,
+                queries: [
+                    Query.equal(
+                        '$id',
+                        documentId,
+                    ),
+                    Query.equal(
+                        'status',
+                        'pending',
+                    ),
+                ],
+                data: {
+                    status: 'processing',
+                    claimedAt,
+                },
+            });
+    } catch {
+        throw new Error(
+            'KeepFlip could not claim the eBay OAuth state.',
+        );
+    }
+
+    const updatedCount =
+        Number(
+            updateResponse?.total ??
+                updateResponse?.documents?.length ??
+                0,
+        );
+
+    if (updatedCount < 1) {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state has expired, was already used, or does not match this callback.',
+        );
+    }
+
+    return {
+        documentId,
+        claimedAt,
+    };
+}
+
+async function markOAuthState({
+    databases,
+    config,
+    documentId,
+    status,
+    failureCode,
+}) {
+    const data = {
+        status,
+        completedAt:
+            new Date().toISOString(),
+    };
+
+    if (failureCode) {
+        data.failureCode = failureCode;
+    }
+
+    try {
+        await databases.updateDocument({
+            databaseId:
+                config.databaseId,
+            collectionId:
+                config.oauthStatesCollectionId,
+            documentId,
+            data,
+        });
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 async function handleConnect({
@@ -1151,6 +1384,8 @@ async function handleCallback({
 
     let state;
     let config;
+    let stateDocumentId;
+    let stateClaimed = false;
 
     try {
         state = verifyState(
@@ -1158,6 +1393,17 @@ async function handleCallback({
             stateSecret(),
         );
         config = loadConfig(state.environment);
+
+        const claim =
+            await claimOAuthState({
+                databases,
+                config,
+                state: returnedState,
+                payload: state,
+            });
+
+        stateDocumentId = claim.documentId;
+        stateClaimed = true;
     } catch (caught) {
         error(
             `eBay OAuth callback state validation failed: ${caught?.message || String(caught)}`,
@@ -1198,6 +1444,20 @@ async function handleCallback({
             `eBay ${config.environment} authorization was declined or returned without a code.`,
         );
 
+        const marked =
+            await markOAuthState({
+                databases,
+                config,
+                documentId: stateDocumentId,
+                status: 'declined',
+            });
+
+        if (!marked) {
+            error(
+                'eBay OAuth state could not be marked declined.',
+            );
+        }
+
         return res.redirect(
             appReturnUrl(
                 config,
@@ -1229,6 +1489,20 @@ async function handleCallback({
             ebayIdentity,
         });
 
+        const marked =
+            await markOAuthState({
+                databases,
+                config,
+                documentId: stateDocumentId,
+                status: 'completed',
+            });
+
+        if (!marked) {
+            error(
+                'eBay OAuth state could not be marked completed.',
+            );
+        }
+
         log(
             `eBay ${config.environment} account connected for KeepFlip user ${state.userId}.`,
         );
@@ -1241,6 +1515,23 @@ async function handleCallback({
             302,
         );
     } catch (caught) {
+        if (stateClaimed) {
+            const marked =
+                await markOAuthState({
+                    databases,
+                    config,
+                    documentId: stateDocumentId,
+                    status: 'failed',
+                    failureCode: 'CALLBACK_FAILED',
+                });
+
+            if (!marked) {
+                error(
+                    'eBay OAuth state could not be marked failed.',
+                );
+            }
+        }
+
         error(
             `eBay ${config.environment} OAuth callback failed: ${caught?.message || String(caught)}`,
         );
@@ -1272,19 +1563,36 @@ export default async function main({
             return res.json({
                 ok: true,
                 service:
-                    'KeepFlip eBay OAuth',
+                    'KeepFlip eBay OAuth callback',
                 flow:
                     'authorization_code',
+                routes: [
+                    EBAY_CALLBACK_PATH,
+                    EBAY_DECLINED_PATH,
+                ],
             });
+        }
+
+        if (
+            req.method !== 'GET' ||
+            (
+                path !== EBAY_CALLBACK_PATH &&
+                path !== EBAY_DECLINED_PATH
+            )
+        ) {
+            return res.json(
+                {
+                    error: 'Endpoint not found.',
+                },
+                404,
+            );
         }
 
         const callbackRequest =
             req.method === 'GET' &&
             (
                 path === EBAY_CALLBACK_PATH ||
-                path === LEGACY_EBAY_CALLBACK_PATH ||
-                path === EBAY_DECLINED_PATH ||
-                path === LEGACY_EBAY_DECLINED_PATH
+                path === EBAY_DECLINED_PATH
             );
 
         const hasLegacyAuthCallbackParameters =
@@ -1350,9 +1658,7 @@ export default async function main({
             req.method === 'GET' &&
             (
                 path === EBAY_CALLBACK_PATH ||
-                path === LEGACY_EBAY_CALLBACK_PATH ||
-                path === EBAY_DECLINED_PATH ||
-                path === LEGACY_EBAY_DECLINED_PATH
+                path === EBAY_DECLINED_PATH
             )
         ) {
             return await handleCallback({
@@ -1362,8 +1668,7 @@ export default async function main({
                 error,
                 databases,
                 declinedPath:
-                    path === EBAY_DECLINED_PATH ||
-                    path === LEGACY_EBAY_DECLINED_PATH,
+                    path === EBAY_DECLINED_PATH,
             });
         }
 
