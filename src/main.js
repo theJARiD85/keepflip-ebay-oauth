@@ -739,7 +739,7 @@ async function getEbayIdentity(config, accessToken) {
             .join(': ');
 
         throw new Error(
-            `eBay Identity rejected the connected account lookup (HTTP ${response.status}${
+            `eBay Identity rejected the connected account lookup (HTTP ${response}${
                 providerDetail ? `: ${providerDetail}` : ''
             }).`,
         );
