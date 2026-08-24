@@ -53,6 +53,26 @@ function normalizeEnvironment(value, label = 'environment') {
     return normalized;
 }
 
+function opaqueOAuthState(value) {
+    if (typeof value !== 'string') {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state is missing or invalid.',
+        );
+    }
+
+    const state = value.trim();
+
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(state)) {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state is missing or invalid.',
+        );
+    }
+
+    return state;
+}
+
 function ebayEnvironmentName(environment) {
     return environment === 'production' ? 'PRODUCTION' : 'SANDBOX';
 }
@@ -146,6 +166,20 @@ function loadConfig(environment) {
 
         encryptionKey: tokenEncryptionKey(),
         stateSecret: stateSecret(),
+    };
+}
+
+function loadOAuthStateStoreConfig() {
+    return {
+        databaseId:
+            process.env.APPWRITE_EBAY_DATABASE_ID?.trim() ||
+            process.env.APPWRITE_DATABASE_ID?.trim() ||
+            'keepflip',
+
+        oauthStatesCollectionId:
+            process.env.APPWRITE_EBAY_OAUTH_STATES_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_EBAY_STATES_COLLECTION_ID?.trim() ||
+            'ebay_oauth_states',
     };
 }
 
@@ -998,6 +1032,7 @@ function fallbackAppReturnUrl(status) {
 function appReturnUrl(
     config,
     status,
+    state,
 ) {
     const url =
         new URL(
@@ -1014,7 +1049,67 @@ function appReturnUrl(
         config.environment,
     );
 
+    if (state) {
+        url.searchParams.set(
+            'state',
+            state,
+        );
+    }
+
     return url.toString();
+}
+
+async function readOAuthStateRecord({
+    databases,
+    state,
+}) {
+    const stateStore =
+        loadOAuthStateStoreConfig();
+    const documentId =
+        oauthStateDocumentId(state);
+
+    let record;
+
+    try {
+        record =
+            await databases.getDocument({
+                databaseId:
+                    stateStore.databaseId,
+                collectionId:
+                    stateStore.oauthStatesCollectionId,
+                documentId,
+            });
+    } catch (caught) {
+        if (Number(caught?.code) === 404) {
+            throw new HttpError(
+                400,
+                'The eBay OAuth state is missing or invalid.',
+            );
+        }
+
+        throw new Error(
+            'KeepFlip could not read the eBay OAuth state.',
+        );
+    }
+
+    const userId =
+        cleanText(record?.ownerId, 128);
+
+    if (!userId) {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state is missing or invalid.',
+        );
+    }
+
+    return {
+        environment:
+            normalizeEnvironment(
+                record?.environment,
+                'stored OAuth environment',
+            ),
+        userId,
+    };
 }
 
 async function claimOAuthState({
@@ -1364,34 +1459,41 @@ async function handleCallback({
         );
     }
 
-    const returnedState =
+    const rawReturnedState =
         queryValue(
             req,
             'state',
         );
 
     const stateFormat =
-        returnedState.length === 0
+        rawReturnedState.length === 0
             ? 'missing'
-            : returnedState.split('.').length === 2
-                ? 'signed'
-                : 'legacy';
+            : 'opaque';
 
     log(
         `eBay OAuth callback state received: ${stateFormat}; ` +
-            `length=${returnedState.length}.`,
+            `length=${rawReturnedState.length}.`,
     );
 
     let state;
     let config;
     let stateDocumentId;
     let stateClaimed = false;
+    let returnedState;
 
     try {
-        state = verifyState(
-            returnedState,
-            stateSecret(),
+        returnedState = opaqueOAuthState(
+            rawReturnedState,
         );
+        const storedState =
+            await readOAuthStateRecord({
+                databases,
+                state: returnedState,
+            });
+        state = {
+            environment: storedState.environment,
+            userId: storedState.userId,
+        };
         config = loadConfig(state.environment);
 
         const claim =
@@ -1462,6 +1564,7 @@ async function handleCallback({
             appReturnUrl(
                 config,
                 'declined',
+                returnedState,
             ),
             302,
         );
@@ -1511,6 +1614,7 @@ async function handleCallback({
             appReturnUrl(
                 config,
                 'connected',
+                returnedState,
             ),
             302,
         );
@@ -1540,6 +1644,7 @@ async function handleCallback({
             appReturnUrl(
                 config,
                 'error',
+                returnedState,
             ),
             302,
         );
