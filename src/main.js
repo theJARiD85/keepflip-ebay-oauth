@@ -881,21 +881,19 @@ async function saveNewConnection({
         documentId,
         data: {
             ownerId: userId,
-            environment: config.environment,
-            ebayUserIdHmac: hashEbayUserId(
+            hashedEbayId: hashEbayUserId(
                 ebayIdentity.userId,
             ),
-            status: 'active',
-            tokenCiphertext: encryptSecret(
+            encryptedTokens: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            accessTokenExpiresAt:
-                tokenBundle.accessTokenExpiresAt,
-            refreshTokenExpiresAt:
-                tokenBundle.refreshTokenExpiresAt,
-            scopeText: tokenBundle.scopeList,
-            createdAt: tokenBundle.connectedAt,
+            ebayUsername:
+                cleanText(
+                    ebayIdentity.username ||
+                        ebayIdentity.userId,
+                    255,
+                ) || ebayIdentity.userId,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -992,16 +990,10 @@ async function refreshStoredConnection({
         documentId:
             connection.$id,
         data: {
-            status: 'active',
-            tokenCiphertext: encryptSecret(
+            encryptedTokens: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            accessTokenExpiresAt:
-                tokenBundle.accessTokenExpiresAt,
-            refreshTokenExpiresAt:
-                tokenBundle.refreshTokenExpiresAt,
-            scopeText: tokenBundle.scopeList,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
