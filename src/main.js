@@ -682,8 +682,8 @@ function hashEbayUserId(ebayUserId) {
 
 function ebayIdentityEndpoint(environment) {
     return environment === 'production'
-        ? 'https://api.ebay.com/commerce/identity/v1/user/'
-        : 'https://api.sandbox.ebay.com/commerce/identity/v1/user/';
+        ? 'https://apiz.ebay.com/commerce/identity/v1/user/'
+        : 'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/';
 }
 
 async function getEbayIdentity(config, accessToken) {
