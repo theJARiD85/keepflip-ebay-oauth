@@ -3,6 +3,10 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "check": "node --check src/main.js && node --check src/original-main.js && node --check src/scope-policy.js",
+    "test": "node --test test/scope-policy.test.js"
+  },
   "dependencies": {
     "ebay-oauth-nodejs-client": "^1.2.2",
     "node-appwrite": "^27.1.0"
