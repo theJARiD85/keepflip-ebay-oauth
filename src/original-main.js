@@ -63,8 +63,11 @@ function opaqueOAuthState(value) {
 
     const state = value.trim();
 
-    if (!/^[A-Za-z0-9_-]{32,128}$/.test(state)) {
-        throw new HttpError(
+    if (
+        state.length < 32 ||
+        state.length > 512 ||
+        !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(state)
+    ) {        throw new HttpError(
             400,
             'The eBay OAuth state is missing or invalid.',
         );
