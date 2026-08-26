@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "check": "node --check src/main.js && node --check src/original-main.js && node --check src/scope-policy.js",
-    "test": "node --test test/scope-policy.test.js"
+    "test": "node --test test/scope-policy.test.js test/main.test.js"
   },
   "dependencies": {
     "ebay-oauth-nodejs-client": "^1.2.2",
