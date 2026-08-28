@@ -182,6 +182,13 @@ test('exchanges a Sandbox callback with the official client, writes encrypted to
   );
   assert.equal(stateWrites[0].data.status, 'processing');
   assert.equal(stateWrites.at(-1).data.status, 'completed');
+  assert.deepEqual(
+    stateWrites[0].queries.map((query) => JSON.parse(query)),
+    [
+      { method: 'equal', attribute: '$id', values: [oauthStateRowId(state)] },
+      { method: 'equal', attribute: 'status', values: ['pending'] },
+    ],
+  );
 });
 
 test('uses the environment saved with the state on the shared callback route', async (t) => {
