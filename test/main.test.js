@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
 import test from 'node:test';
 import {
   connectionRowId,
@@ -9,7 +8,6 @@ import {
 
 const FIXED_NOW = new Date('2026-08-25T12:00:00.000Z');
 const ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
-const HMAC_KEY = Buffer.alloc(32, 8).toString('base64');
 
 function jsonResponse(body, status = 200) {
   return {
@@ -30,7 +28,6 @@ function installEnvironment(t) {
     EBAY_PRODUCTION_CLIENT_SECRET: 'production-secret',
     EBAY_PRODUCTION_RU_NAME: 'KeepFlip-Production-RuName',
     EBAY_TOKEN_ENCRYPTION_KEY: ENCRYPTION_KEY,
-    EBAY_USER_ID_HMAC_KEY: HMAC_KEY,
     EBAY_APP_RETURN_URL: 'keepflip://ebay/connected',
     APPWRITE_EBAY_DATABASE_ID: 'keepflip',
     APPWRITE_EBAY_CONNECTIONS_TABLE_ID: 'ebay_connections',
@@ -86,18 +83,30 @@ function stateRecord(environment, ownerId = 'keepflip-user-123') {
   };
 }
 
-test('exchanges a Sandbox callback, writes encrypted tokens, HMAC identity, and a display username, then deep-links safely', async (t) => {
+test('exchanges a Sandbox callback with the official client, writes encrypted tokens, and deep-links safely', async (t) => {
   installEnvironment(t);
   const state = Buffer.alloc(32, 4).toString('base64url');
   const code = 'sandbox-authorize-code';
   const ownerId = 'keepflip-user-123';
-  const rawEbayUserId = 'ebay-user-456';
   const calls = [];
   let savedConnection;
 
   const handler = createHandler({
     now: () => FIXED_NOW,
     randomBytesImpl: (size) => Buffer.alloc(size, 9),
+    ebayAuthTokenFactory: (configuration) => ({
+      exchangeCodeForAccessToken: async (environment, receivedCode) => {
+        assert.equal(environment, 'SANDBOX');
+        assert.equal(receivedCode, code);
+        assert.equal(configuration.ruName, 'KeepFlip-Sandbox-RuName');
+        return {
+          access_token: 'raw-access-token',
+          refresh_token: 'raw-refresh-token',
+          expires_in: 7_200,
+          refresh_token_expires_in: 31_536_000,
+        };
+      },
+    }),
     fetchImpl: async (url, options = {}) => {
       const request = {
         url: String(url),
@@ -124,29 +133,6 @@ test('exchanges a Sandbox callback, writes encrypted tokens, HMAC identity, and 
         return jsonResponse({ total: 1 });
       }
 
-      if (
-        request.method === 'POST' &&
-        request.url === 'https://api.sandbox.ebay.com/identity/v1/oauth2/token'
-      ) {
-        const form = new URLSearchParams(request.body);
-        assert.equal(form.get('grant_type'), 'authorization_code');
-        assert.equal(form.get('code'), code);
-        assert.equal(form.get('redirect_uri'), 'KeepFlip-Sandbox-RuName');
-        return jsonResponse({
-          access_token: 'raw-access-token',
-          refresh_token: 'raw-refresh-token',
-          expires_in: 7_200,
-          refresh_token_expires_in: 31_536_000,
-        });
-      }
-
-      if (
-        request.method === 'GET' &&
-        request.url ===
-          'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/'
-      ) {
-        return jsonResponse({ userId: rawEbayUserId });
-      }
 
       if (
         request.method === 'PUT' &&
@@ -177,20 +163,12 @@ test('exchanges a Sandbox callback, writes encrypted tokens, HMAC identity, and 
   assert.equal(destination.pathname, '/connected');
   assert.equal(destination.searchParams.get('status'), 'connected');
   assert.equal(destination.searchParams.get('environment'), 'sandbox');
-  assert.equal(destination.searchParams.has('state'), false);
+  assert.equal(destination.searchParams.get('state'), state);
   assert.equal(destination.searchParams.has('code'), false);
   assert.equal(result.redirect.url.includes('raw-access-token'), false);
   assert.equal(result.redirect.url.includes('raw-refresh-token'), false);
 
   assert.equal(savedConnection.data.ownerId, ownerId);
-  assert.equal(
-    savedConnection.data.hashedEbayId,
-    createHmac('sha256', Buffer.from(HMAC_KEY, 'base64'))
-      .update('keepflip|ebay-user-id|v1|' + rawEbayUserId, 'utf8')
-      .digest('hex'),
-  );
-  assert.equal(savedConnection.data.hashedEbayId.length, 64);
-  assert.equal(savedConnection.data.ebayUsername, rawEbayUserId);
   assert.equal(savedConnection.data.encryptedTokens.startsWith('v1.'), true);
   assert.equal(savedConnection.data.encryptedTokens.includes('raw-access-token'), false);
   assert.equal(savedConnection.data.encryptedTokens.includes('raw-refresh-token'), false);
@@ -210,18 +188,37 @@ test('uses the environment saved with the state on the shared callback route', a
   installEnvironment(t);
   const state = Buffer.alloc(32, 5).toString('base64url');
   const calls = [];
+  let exchangedEnvironment;
+  let savedConnection;
   const handler = createHandler({
     now: () => FIXED_NOW,
+    ebayAuthTokenFactory: () => ({
+      exchangeCodeForAccessToken: async (environment, code) => {
+        exchangedEnvironment = environment;
+        assert.equal(code, 'should-not-exchange');
+        return {
+          access_token: 'sandbox-access-token',
+          refresh_token: 'sandbox-refresh-token',
+          expires_in: 7_200,
+          refresh_token_expires_in: 31_536_000,
+        };
+      },
+    }),
     fetchImpl: async (url, options = {}) => {
       const request = { url: String(url), method: options.method || 'GET' };
+      const target = new URL(request.url);
       calls.push(request);
       if (request.method === 'GET') return jsonResponse(stateRecord('sandbox'));
       if (request.method === 'PATCH') return jsonResponse({ total: 1 });
       if (
-        request.url ===
-        'https://api.sandbox.ebay.com/identity/v1/oauth2/token'
+        request.method === 'PUT' &&
+        target.pathname.endsWith(
+          '/tablesdb/keepflip/tables/ebay_connections/rows/' +
+            connectionRowId('keepflip-user-123', 'sandbox'),
+        )
       ) {
-        return jsonResponse({});
+        savedConnection = JSON.parse(options.body);
+        return jsonResponse({ $id: connectionRowId('keepflip-user-123', 'sandbox') }, 201);
       }
       throw new Error('Unexpected request: ' + request.method + ' ' + request.url);
     },
@@ -235,15 +232,15 @@ test('uses the environment saved with the state on the shared callback route', a
   });
 
   const destination = new URL(result.redirect.url);
-  assert.equal(destination.searchParams.get('status'), 'error');
+  assert.equal(destination.searchParams.get('status'), 'connected');
   assert.equal(destination.searchParams.get('environment'), 'sandbox');
+  assert.equal(destination.searchParams.get('state'), state);
+  assert.equal(exchangedEnvironment, 'SANDBOX');
+  assert.equal(savedConnection.data.ownerId, 'keepflip-user-123');
+  assert.equal(savedConnection.data.encryptedTokens.startsWith('v1.'), true);
   assert.equal(
-    calls.some((call) => call.url.includes('api.sandbox.ebay.com/identity/v1/oauth2/token')),
+    calls.some((call) => call.url.includes('/tablesdb/keepflip/tables/ebay_connections/rows/')),
     true,
-  );
-  assert.equal(
-    calls.some((call) => call.url.includes('api.ebay.com/identity/v1/oauth2/token')),
-    false,
   );
 });
 
@@ -288,6 +285,7 @@ test('marks a user-declined Sandbox request without attempting token exchange', 
 
   const destination = new URL(result.redirect.url);
   assert.equal(destination.searchParams.get('status'), 'declined');
+  assert.equal(destination.searchParams.get('state'), state);
   assert.equal(
     calls.some((call) => call.url.includes('api.sandbox.ebay.com/identity')),
     false,
@@ -328,3 +326,6 @@ test('does not replay a state whose conditional claim affects no row', async (t)
     false,
   );
 });
+
+
+

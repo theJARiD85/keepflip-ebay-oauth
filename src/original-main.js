@@ -1,9 +1,12 @@
 import {
   createCipheriv,
   createHash,
-  createHmac,
   randomBytes,
 } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const EbayAuthToken = require('ebay-oauth-nodejs-client');
 import { KEEPFLIP_EBAY_USER_SCOPES } from './scope-policy.js';
 
 const STATE_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
@@ -206,7 +209,6 @@ function configurationFor(environment) {
     ]),
     scopeText: KEEPFLIP_EBAY_USER_SCOPES.join(' '),
     encryptionKey: decodeBase64Key('EBAY_TOKEN_ENCRYPTION_KEY'),
-    hmacKey: decodeBase64Key('EBAY_USER_ID_HMAC_KEY'),
   };
 }
 
@@ -333,7 +335,7 @@ function authorizationDeclined(req) {
   );
 }
 
-function appReturnUrl(environment, status) {
+function appReturnUrl(environment, status, state = '') {
   const raw =
     firstEnvironmentValue(['EBAY_APP_RETURN_URL']) ||
     'keepflip://ebay/connected';
@@ -353,24 +355,26 @@ function appReturnUrl(environment, status) {
   url.hash = '';
   url.searchParams.set('status', status);
   url.searchParams.set('environment', environment);
+  if (state) url.searchParams.set('state', state);
   return url.toString();
 }
 
-function fallbackAppReturnUrl(environment, status) {
+function fallbackAppReturnUrl(environment, status, state = '') {
   try {
-    return appReturnUrl(environment, status);
+    return appReturnUrl(environment, status, state);
   } catch {
     return (
       'keepflip://ebay/connected?status=' +
       encodeURIComponent(status) +
       '&environment=' +
-      encodeURIComponent(environment)
+      encodeURIComponent(environment) +
+      (state ? '&state=' + encodeURIComponent(state) : '')
     );
   }
 }
 
-function redirectToApp(res, environment, status) {
-  return res.redirect(fallbackAppReturnUrl(environment, status), 302);
+function redirectToApp(res, environment, status, state = '') {
+  return res.redirect(fallbackAppReturnUrl(environment, status, state), 302);
 }
 
 async function readAndClaimState({
@@ -490,54 +494,55 @@ async function markState({
   }
 }
 
-function ebayTokenEndpoint(environment) {
-  return environment === 'production'
-    ? 'https://api.ebay.com/identity/v1/oauth2/token'
-    : 'https://api.sandbox.ebay.com/identity/v1/oauth2/token';
+function ebayEnvironmentName(environment) {
+  return environment === 'production' ? 'PRODUCTION' : 'SANDBOX';
 }
 
-function ebayIdentityEndpoint(environment) {
-  return environment === 'production'
-    ? 'https://apiz.ebay.com/commerce/identity/v1/user/'
-    : 'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/';
+function createEbayClient(configuration, EbayAuthTokenImpl = EbayAuthToken) {
+  return new EbayAuthTokenImpl({
+    clientId: configuration.clientId,
+    clientSecret: configuration.clientSecret,
+    redirectUri: configuration.ruName,
+    env: ebayEnvironmentName(configuration.environment),
+  });
+}
+
+function parseTokenResponse(payload) {
+  if (typeof payload === 'string') {
+    try {
+      return JSON.parse(payload);
+    } catch {
+      throw new CallbackError(502, 'eBay returned an invalid authorization response.');
+    }
+  }
+
+  return payload && typeof payload === 'object' ? payload : {};
 }
 
 async function exchangeAuthorizationCode({
-  fetchImpl,
   configuration,
   code,
+  ebayAuthTokenFactory,
 }) {
-  const form = new URLSearchParams();
-  form.set('grant_type', 'authorization_code');
-  form.set('code', code);
-  form.set('redirect_uri', configuration.ruName);
-
-  let response;
   try {
-    response = await fetchImpl(ebayTokenEndpoint(configuration.environment), {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        Authorization:
-          'Basic ' +
-          Buffer.from(
-            configuration.clientId + ':' + configuration.clientSecret,
-            'utf8',
-          ).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: form.toString(),
-    });
-  } catch {
-    throw new CallbackError(502, 'KeepFlip could not exchange the eBay authorization.');
-  }
+    const payload = await ebayAuthTokenFactory(configuration).exchangeCodeForAccessToken(
+      ebayEnvironmentName(configuration.environment),
+      code,
+    );
+    const parsed = parseTokenResponse(payload);
 
-  const payload = await parseResponseBody(response);
-  if (!response.ok) {
-    throw new CallbackError(502, 'KeepFlip could not exchange the eBay authorization.');
-  }
+    if (parsed.error) {
+      throw new Error(parsed.error_description || parsed.error);
+    }
 
-  return payload;
+    return parsed;
+  } catch (caught) {
+    if (caught instanceof CallbackError) throw caught;
+    throw new CallbackError(
+      502,
+      'KeepFlip could not exchange the eBay authorization.',
+    );
+  }
 }
 
 function tokenBundleFromResponse({ payload, configuration, now }) {
@@ -561,30 +566,6 @@ function tokenBundleFromResponse({ payload, configuration, now }) {
   };
 }
 
-async function ebayUserId({ fetchImpl, configuration, accessToken }) {
-  let response;
-
-  try {
-    response = await fetchImpl(ebayIdentityEndpoint(configuration.environment), {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        Authorization: 'Bearer ' + accessToken,
-      },
-    });
-  } catch {
-    throw new CallbackError(502, 'KeepFlip could not verify the eBay account.');
-  }
-
-  const payload = await parseResponseBody(response);
-  const userId = cleanText(payload?.userId, 512);
-  if (!response.ok || !userId) {
-    throw new CallbackError(502, 'KeepFlip could not verify the eBay account.');
-  }
-
-  return userId;
-}
-
 function encryptSecret(value, key, randomBytesImpl = randomBytes) {
   const iv = randomBytesImpl(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
@@ -602,12 +583,6 @@ function encryptSecret(value, key, randomBytesImpl = randomBytes) {
   ].join('.');
 }
 
-function hmacEbayUserId(userId, hmacKey) {
-  return createHmac('sha256', hmacKey)
-    .update('keepflip|ebay-user-id|v1|' + userId, 'utf8')
-    .digest('hex');
-}
-
 async function saveConnection({
   fetchImpl,
   runtime,
@@ -615,13 +590,10 @@ async function saveConnection({
   apiKey,
   ownerId,
   tokenBundle,
-  userId,
   randomBytesImpl,
 }) {
   const data = {
     ownerId,
-    hashedEbayId: hmacEbayUserId(userId, configuration.hmacKey),
-    ebayUsername: cleanText(userId, 128),
     encryptedTokens: encryptSecret(
       JSON.stringify(tokenBundle),
       configuration.encryptionKey,
@@ -658,15 +630,18 @@ async function handleCallback({
   fetchImpl,
   now,
   randomBytesImpl,
+  ebayAuthTokenFactory,
 }) {
   const runtime = functionRuntime();
   const stateConfiguration = tableConfiguration();
   let configuration;
   let environment = 'sandbox';
   let claimed;
+  let callbackState = '';
 
   try {
     const state = opaqueState(req);
+    callbackState = state;
     claimed = await readAndClaimState({
       fetchImpl,
       req,
@@ -693,25 +668,19 @@ async function handleCallback({
         error('KeepFlip eBay OAuth callback could not mark a declined request.');
       }
 
-      return redirectToApp(res, environment, 'declined');
+      return redirectToApp(res, environment, 'declined', callbackState);
     }
 
     const tokenResponse = await exchangeAuthorizationCode({
-      fetchImpl,
       configuration,
       code: authorizationCode(req),
+      ebayAuthTokenFactory,
     });
     const tokenBundle = tokenBundleFromResponse({
       payload: tokenResponse,
       configuration,
       now,
     });
-    const userId = await ebayUserId({
-      fetchImpl,
-      configuration,
-      accessToken: tokenBundle.accessToken,
-    });
-
     await saveConnection({
       fetchImpl,
       runtime,
@@ -719,7 +688,6 @@ async function handleCallback({
       apiKey: claimed.apiKey,
       ownerId: claimed.ownerId,
       tokenBundle,
-      userId,
       randomBytesImpl,
     });
 
@@ -736,8 +704,8 @@ async function handleCallback({
       error('KeepFlip eBay OAuth callback could not mark a completed request.');
     }
 
-    return redirectToApp(res, environment, 'connected');
-  } catch {
+    return redirectToApp(res, environment, 'connected', callbackState);
+  } catch (caught) {
     if (claimed) {
       await markState({
         fetchImpl,
@@ -752,10 +720,13 @@ async function handleCallback({
     }
 
     if (typeof error === 'function') {
-      error('KeepFlip eBay OAuth callback failed.');
+      error(
+        'KeepFlip eBay OAuth callback failed: ' +
+          (caught?.message || 'unknown callback error'),
+      );
     }
 
-    return redirectToApp(res, environment, 'error');
+    return redirectToApp(res, environment, 'error', callbackState);
   }
 }
 
@@ -769,6 +740,7 @@ export function createHandler({
   fetchImpl = globalThis.fetch,
   now = () => new Date(),
   randomBytesImpl = randomBytes,
+  ebayAuthTokenFactory = (configuration) => createEbayClient(configuration),
 } = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new Error('A fetch implementation is required.');
@@ -803,6 +775,7 @@ export function createHandler({
         fetchImpl,
         now,
         randomBytesImpl,
+        ebayAuthTokenFactory,
       });
     } catch {
       safeError(error);
@@ -813,7 +786,10 @@ export function createHandler({
 
 export const __testables = {
   encryptSecret,
-  hmacEbayUserId,
+  createEbayClient,
+  parseTokenResponse,
 };
 
 export default createHandler();
+
+
