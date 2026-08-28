@@ -432,12 +432,12 @@ async function readAndClaimState({
         queries: [
           JSON.stringify({
             method: 'equal',
-            column: '$id',
+            attribute: '$id',
             values: [stateRowId],
           }),
           JSON.stringify({
             method: 'equal',
-            column: 'status',
+            attribute: 'status',
             values: ['pending'],
           }),
         ],
