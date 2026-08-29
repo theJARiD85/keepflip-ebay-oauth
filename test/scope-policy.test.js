@@ -10,6 +10,7 @@ test('uses only the scopes required by the connected-account identity flow', () 
   assert.deepEqual(KEEPFLIP_EBAY_USER_SCOPES, [
     'https://api.ebay.com/oauth/api_scope',
     'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
+    'https://api.ebay.com/oauth/api_scope/sell.inventory',
   ]);
 });
 
@@ -23,7 +24,7 @@ test('overwrites a stale broad OAuth scope environment value', () => {
 
   assert.equal(
     value,
-    'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
+    'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/commerce.identity.readonly https://api.ebay.com/oauth/api_scope/sell.inventory',
   );
   assert.equal(environment.EBAY_OAUTH_SCOPES, value);
 });
