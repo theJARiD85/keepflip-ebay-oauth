@@ -135,13 +135,11 @@ test('exchanges a Sandbox callback with the official client, writes encrypted to
 
 
       if (
-        request.method === 'PUT' &&
-        target.pathname.endsWith(
-          '/tablesdb/keepflip/tables/ebay_connections/rows/' +
-            connectionRowId(ownerId, 'sandbox'),
-        )
+        request.method === 'POST' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_connections/rows')
       ) {
         savedConnection = JSON.parse(request.body);
+        assert.equal(savedConnection.rowId, connectionRowId(ownerId, 'sandbox'));
         return jsonResponse({ $id: connectionRowId(ownerId, 'sandbox') }, 201);
       }
 
@@ -218,13 +216,11 @@ test('uses the environment saved with the state on the shared callback route', a
       if (request.method === 'GET') return jsonResponse(stateRecord('sandbox'));
       if (request.method === 'PATCH') return jsonResponse({ total: 1 });
       if (
-        request.method === 'PUT' &&
-        target.pathname.endsWith(
-          '/tablesdb/keepflip/tables/ebay_connections/rows/' +
-            connectionRowId('keepflip-user-123', 'sandbox'),
-        )
+        request.method === 'POST' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_connections/rows')
       ) {
         savedConnection = JSON.parse(options.body);
+        assert.equal(savedConnection.rowId, connectionRowId('keepflip-user-123', 'sandbox'));
         return jsonResponse({ $id: connectionRowId('keepflip-user-123', 'sandbox') }, 201);
       }
       throw new Error('Unexpected request: ' + request.method + ' ' + request.url);
@@ -246,9 +242,78 @@ test('uses the environment saved with the state on the shared callback route', a
   assert.equal(savedConnection.data.ownerId, 'keepflip-user-123');
   assert.equal(savedConnection.data.encryptedTokens.startsWith('v1.'), true);
   assert.equal(
-    calls.some((call) => call.url.includes('/tablesdb/keepflip/tables/ebay_connections/rows/')),
+    calls.some((call) => call.url.endsWith('/tablesdb/keepflip/tables/ebay_connections/rows')),
     true,
   );
+});
+
+test('updates a reconnected eBay account after a deterministic-row conflict', async (t) => {
+  installEnvironment(t);
+  const state = Buffer.alloc(32, 8).toString('base64url');
+  const ownerId = 'keepflip-user-123';
+  const rowId = connectionRowId(ownerId, 'sandbox');
+  const connectionWrites = [];
+  const handler = createHandler({
+    now: () => FIXED_NOW,
+    ebayAuthTokenFactory: () => ({
+      exchangeCodeForAccessToken: async () => ({
+        access_token: 'sandbox-access-token',
+        refresh_token: 'sandbox-refresh-token',
+        expires_in: 7_200,
+        refresh_token_expires_in: 31_536_000,
+      }),
+    }),
+    fetchImpl: async (url, options = {}) => {
+      const request = {
+        body: options.body,
+        method: options.method || 'GET',
+        url: String(url),
+      };
+      const target = new URL(request.url);
+
+      if (request.method === 'GET') return jsonResponse(stateRecord('sandbox', ownerId));
+      if (
+        request.method === 'PATCH' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_oauth_states/rows')
+      ) {
+        return jsonResponse({ total: 1 });
+      }
+      if (
+        request.method === 'POST' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_connections/rows')
+      ) {
+        connectionWrites.push({ method: request.method, body: JSON.parse(request.body) });
+        return jsonResponse({}, 409);
+      }
+      if (
+        request.method === 'PATCH' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_connections/rows/' + rowId)
+      ) {
+        connectionWrites.push({ method: request.method, body: JSON.parse(request.body) });
+        return jsonResponse({ $id: rowId });
+      }
+      if (request.method === 'PATCH') return jsonResponse({ $id: oauthStateRowId(state) });
+
+      throw new Error('Unexpected request: ' + request.method + ' ' + request.url);
+    },
+  });
+  const { res, result } = responseRecorder();
+
+  await handler({
+    req: callbackRequest({ state, code: 'reconnect-code' }),
+    res,
+    error: () => {},
+  });
+
+  const destination = new URL(result.redirect.url);
+  assert.equal(destination.searchParams.get('status'), 'connected');
+  assert.deepEqual(
+    connectionWrites.map((write) => write.method),
+    ['POST', 'PATCH'],
+  );
+  assert.equal(connectionWrites[0].body.rowId, rowId);
+  assert.equal(connectionWrites[1].body.data.ownerId, ownerId);
+  assert.equal(connectionWrites[1].body.data.encryptedTokens.startsWith('v1.'), true);
 });
 
 test('marks a user-declined Sandbox request without attempting token exchange', async (t) => {

@@ -61,7 +61,7 @@ function firstEnvironmentValue(names, fallback = '') {
 function requiredEnvironmentValue(names) {
   const value = firstEnvironmentValue(names);
   if (!value) {
-    throw new Error('Missing required eBay OAuth callback configuration.');
+    error('Missing required eBay OAuth callback configuration.');
   }
 
   return value;
@@ -73,7 +73,7 @@ function normalizeEnvironment(value, label = 'OAuth environment') {
     return environment;
   }
 
-  throw new CallbackError(400, label + ' must be "sandbox" or "production".');
+  error(400, label + ' must be "sandbox" or "production".');
 }
 
 const EBAY_CALLBACK_PATH = '/oauth/ebay/callback';
@@ -146,7 +146,7 @@ function functionDynamicKey(req) {
     cleanText(process.env.APPWRITE_FUNCTION_API_KEY);
 
   if (!key) {
-    throw new Error('Appwrite did not provide this Function a dynamic API key.');
+    error('Appwrite did not provide this Function a dynamic API key.');
   }
 
   return key;
@@ -182,12 +182,12 @@ function tableConfiguration() {
 function decodeBase64Key(name) {
   const text = requiredEnvironmentValue([name]);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
-    throw new Error(name + ' must be Base64 for exactly 32 bytes.');
+    error(name + ' must be Base64 for exactly 32 bytes.');
   }
 
   const key = Buffer.from(text, 'base64');
   if (key.length !== 32) {
-    throw new Error(name + ' must decode to exactly 32 bytes.');
+    error(name + ' must decode to exactly 32 bytes.');
   }
 
   return key;
@@ -277,7 +277,7 @@ function currentDate(now) {
   const value = now();
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
   if (Number.isNaN(date.getTime())) {
-    throw new Error('The OAuth callback clock is invalid.');
+    log('The OAuth callback clock is invalid.');
   }
 
   return date;
@@ -286,7 +286,7 @@ function currentDate(now) {
 function expiresAt(clock, seconds) {
   const value = Number(seconds);
   if (!Number.isFinite(value) || value <= 0) {
-    throw new CallbackError(502, 'eBay returned incomplete authorization data.');
+    log(502, 'eBay returned incomplete authorization data.');
   }
 
   return new Date(clock.getTime() + value * 1_000).toISOString();
@@ -312,7 +312,7 @@ export function connectionRowId(userId, environment) {
 function opaqueState(req) {
   const state = queryValue(req, 'state', 512);
   if (!STATE_PATTERN.test(state)) {
-    throw new CallbackError(400, 'The eBay authorization request is invalid.');
+    log(400, 'The eBay authorization request is invalid.');
   }
 
   return state;
@@ -321,7 +321,7 @@ function opaqueState(req) {
 function authorizationCode(req) {
   const code = queryValue(req, 'code', 2_048);
   if (!code) {
-    throw new CallbackError(400, 'eBay did not return an authorization code.');
+    log(400, 'eBay did not return an authorization code.');
   }
 
   return code;
@@ -344,11 +344,11 @@ function appReturnUrl(environment, status, state = '') {
   try {
     url = new URL(raw);
   } catch {
-    throw new Error('EBAY_APP_RETURN_URL must be a valid deep-link URL.');
+    error('EBAY_APP_RETURN_URL must be a valid deep-link URL.');
   }
 
   if (url.protocol !== 'keepflip:') {
-    throw new Error('EBAY_APP_RETURN_URL must use the KeepFlip deep-link scheme.');
+    error('EBAY_APP_RETURN_URL must use the KeepFlip deep-link scheme.');
   }
 
   url.search = '';
@@ -398,7 +398,7 @@ async function readAndClaimState({
       failureMessage: 'KeepFlip could not validate the eBay authorization request.',
     });
   } catch {
-    throw new CallbackError(400, 'The eBay authorization request is invalid.');
+    error(400, 'The eBay authorization request is invalid.');
   }
 
   const ownerId = cleanText(record?.ownerId, 64);
@@ -413,7 +413,7 @@ async function readAndClaimState({
     !Number.isFinite(expiresAt) ||
     expiresAt <= clock
   ) {
-    throw new CallbackError(400, 'The eBay authorization request is invalid.');
+    error(400, 'The eBay authorization request is invalid.');
   }
 
   let claimed;
@@ -445,7 +445,7 @@ async function readAndClaimState({
       failureMessage: 'KeepFlip could not claim the eBay authorization request.',
     });
   } catch {
-    throw new CallbackError(409, 'The eBay authorization request is unavailable.');
+    error(409, 'The eBay authorization request is unavailable.');
   }
 
   const affected =
@@ -455,7 +455,7 @@ async function readAndClaimState({
         ? claimed.rows.length
         : 0;
   if (affected !== 1) {
-    throw new CallbackError(409, 'The eBay authorization request is unavailable.');
+    error(409, 'The eBay authorization request is unavailable.');
   }
 
   return { apiKey, ownerId, stateRowId, environment: recordEnvironment };
@@ -512,7 +512,7 @@ function parseTokenResponse(payload) {
     try {
       return JSON.parse(payload);
     } catch {
-      throw new CallbackError(502, 'eBay returned an invalid authorization response.');
+      error(502, 'eBay returned an invalid authorization response.');
     }
   }
 
@@ -532,13 +532,13 @@ async function exchangeAuthorizationCode({
     const parsed = parseTokenResponse(payload);
 
     if (parsed.error) {
-      throw new Error(parsed.error_description || parsed.error);
+      error(parsed.error_description || parsed.error);
     }
 
     return parsed;
   } catch (caught) {
     if (caught instanceof CallbackError) throw caught;
-    throw new CallbackError(
+    error(
       502,
       'KeepFlip could not exchange the eBay authorization.',
     );
@@ -552,7 +552,7 @@ function tokenBundleFromResponse({ payload, configuration, now }) {
     typeof payload?.refresh_token !== 'string' ||
     !payload.refresh_token
   ) {
-    throw new CallbackError(502, 'eBay returned incomplete authorization data.');
+    error(502, 'eBay returned incomplete authorization data.');
   }
 
   const clock = currentDate(now);
@@ -603,22 +603,37 @@ async function saveConnection({
     updatedAt: tokenBundle.updatedAt,
   };
 
+  const rowId = connectionRowId(ownerId, configuration.environment);
+
   try {
     await appwriteJson({
       fetchImpl,
       runtime,
       apiKey,
-      method: 'PUT',
-      path: rowPath(
-        configuration,
-        configuration.connectionsTableId,
-        connectionRowId(ownerId, configuration.environment),
-      ),
+      method: 'POST',
+      path: tableRowsPath(configuration, configuration.connectionsTableId),
+      body: { rowId, data },
+      failureMessage: 'KeepFlip could not save the eBay connection.',
+    });
+    return;
+  } catch (caught) {
+    if (!(caught instanceof UpstreamError && caught.status === 409)) {
+      error(500, 'KeepFlip could not save the eBay connection.');
+    }
+  }
+
+  try {
+    await appwriteJson({
+      fetchImpl,
+      runtime,
+      apiKey,
+      method: 'PATCH',
+      path: rowPath(configuration, configuration.connectionsTableId, rowId),
       body: { data },
       failureMessage: 'KeepFlip could not save the eBay connection.',
     });
   } catch {
-    throw new CallbackError(500, 'KeepFlip could not save the eBay connection.');
+    error(500, 'KeepFlip could not save the eBay connection.');
   }
 }
 
@@ -743,7 +758,7 @@ export function createHandler({
   ebayAuthTokenFactory = (configuration) => createEbayClient(configuration),
 } = {}) {
   if (typeof fetchImpl !== 'function') {
-    throw new Error('A fetch implementation is required.');
+    error('A fetch implementation is required.');
   }
 
   return async function main({ req, res, error } = {}) {
