@@ -604,7 +604,7 @@ async function saveConnection({
     updatedAt: tokenBundle.updatedAt,
     // This is the existing required Appwrite column spelling. Keep it until a
     // database migration can safely replace it with a correctly named field.
-    envionment: configuration.environment,
+    environment: configuration.environment,
   };
 
   const rowId = connectionRowId(ownerId, configuration.environment);
