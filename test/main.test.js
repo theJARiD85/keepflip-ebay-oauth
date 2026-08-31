@@ -147,10 +147,12 @@ test('exchanges a Sandbox callback with the official client, writes encrypted to
     },
   });
   const { res, result } = responseRecorder();
+  const logs = [];
 
   await handler({
     req: callbackRequest({ state, code }),
     res,
+    log: (message) => logs.push(message),
     error: () => {},
   });
 
@@ -167,9 +169,11 @@ test('exchanges a Sandbox callback with the official client, writes encrypted to
   assert.equal(result.redirect.url.includes('raw-refresh-token'), false);
 
   assert.equal(savedConnection.data.ownerId, ownerId);
+  assert.equal(savedConnection.data.envionment, 'sandbox');
   assert.equal(savedConnection.data.encryptedTokens.startsWith('v1.'), true);
   assert.equal(savedConnection.data.encryptedTokens.includes('raw-access-token'), false);
   assert.equal(savedConnection.data.encryptedTokens.includes('raw-refresh-token'), false);
+  assert.deepEqual(logs, ['KeepFlip eBay OAuth connection saved.']);
 
   const stateWrites = calls
     .filter((call) => call.method === 'PATCH')
@@ -314,6 +318,7 @@ test('updates a reconnected eBay account after a deterministic-row conflict', as
   assert.equal(connectionWrites[0].body.rowId, rowId);
   assert.equal(connectionWrites[1].body.data.ownerId, ownerId);
   assert.equal(connectionWrites[1].body.data.encryptedTokens.startsWith('v1.'), true);
+  assert.equal(connectionWrites[1].body.data.envionment, 'sandbox');
 });
 
 test('marks a user-declined Sandbox request without attempting token exchange', async (t) => {
@@ -401,3 +406,49 @@ test('does not replay a state whose conditional claim affects no row', async (t)
 
 
 
+
+
+test('reports an Appwrite connection-write failure without masking it as an undefined reporter', async (t) => {
+  installEnvironment(t);
+  const state = Buffer.alloc(32, 9).toString('base64url');
+  const reports = [];
+  const handler = createHandler({
+    now: () => FIXED_NOW,
+    ebayAuthTokenFactory: () => ({
+      exchangeCodeForAccessToken: async () => ({
+        access_token: 'sandbox-access-token',
+        refresh_token: 'sandbox-refresh-token',
+        expires_in: 7_200,
+        refresh_token_expires_in: 31_536_000,
+      }),
+    }),
+    fetchImpl: async (url, options = {}) => {
+      const target = new URL(String(url));
+      const method = options.method || 'GET';
+      if (method === 'GET') return jsonResponse(stateRecord('sandbox'));
+      if (method === 'POST') return jsonResponse({ message: 'Rejected.' }, 400);
+      if (
+        method === 'PATCH' &&
+        target.pathname.endsWith('/tablesdb/keepflip/tables/ebay_oauth_states/rows')
+      ) {
+        return jsonResponse({ total: 1 });
+      }
+      if (method === 'PATCH') return jsonResponse({});
+      throw new Error('Unexpected request: ' + method + ' ' + url);
+    },
+  });
+  const { res, result } = responseRecorder();
+
+  await handler({
+    req: callbackRequest({ state, code: 'connection-write-rejected' }),
+    res,
+    error: (message) => reports.push(message),
+  });
+
+  assert.equal(new URL(result.redirect.url).searchParams.get('status'), 'error');
+  assert.equal(
+    reports.some((message) => message.includes('KeepFlip could not save the eBay connection.')),
+    true,
+  );
+  assert.equal(reports.some((message) => message.includes('error is not defined')), false);
+});

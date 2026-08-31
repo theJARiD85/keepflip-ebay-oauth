@@ -8,9 +8,11 @@ enforceKeepFlipEbayUserScopes();
 
 export { KEEPFLIP_EBAY_USER_SCOPES, enforceKeepFlipEbayUserScopes } from './scope-policy.js';
 
-export default async function main(context) {
+export default async function main(context = {}) {
+  const { req, res, log, error } = context;
+
   // Re-apply immediately before each request so a stale Appwrite Function
   // environment value cannot silently broaden the user-consent grant.
   enforceKeepFlipEbayUserScopes();
-  return originalHandler(context);
+  return originalHandler({ ...context, req, res, log, error });
 }

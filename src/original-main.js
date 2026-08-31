@@ -27,6 +27,10 @@ class UpstreamError extends Error {
   }
 }
 
+function fail(status, message) {
+  throw new CallbackError(status, message);
+}
+
 function cleanText(value, maxLength = 8_000) {
   if (typeof value !== 'string') return '';
   const text = value.trim();
@@ -61,7 +65,7 @@ function firstEnvironmentValue(names, fallback = '') {
 function requiredEnvironmentValue(names) {
   const value = firstEnvironmentValue(names);
   if (!value) {
-    error('Missing required eBay OAuth callback configuration.');
+    fail(500, 'Missing required eBay OAuth callback configuration.');
   }
 
   return value;
@@ -73,7 +77,7 @@ function normalizeEnvironment(value, label = 'OAuth environment') {
     return environment;
   }
 
-  error(400, label + ' must be "sandbox" or "production".');
+  fail(400, label + ' must be "sandbox" or "production".');
 }
 
 const EBAY_CALLBACK_PATH = '/oauth/ebay/callback';
@@ -146,7 +150,7 @@ function functionDynamicKey(req) {
     cleanText(process.env.APPWRITE_FUNCTION_API_KEY);
 
   if (!key) {
-    error('Appwrite did not provide this Function a dynamic API key.');
+    fail(500, 'Appwrite did not provide this Function a dynamic API key.');
   }
 
   return key;
@@ -182,12 +186,12 @@ function tableConfiguration() {
 function decodeBase64Key(name) {
   const text = requiredEnvironmentValue([name]);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
-    error(name + ' must be Base64 for exactly 32 bytes.');
+    fail(500, name + ' must be Base64 for exactly 32 bytes.');
   }
 
   const key = Buffer.from(text, 'base64');
   if (key.length !== 32) {
-    error(name + ' must decode to exactly 32 bytes.');
+    fail(500, name + ' must decode to exactly 32 bytes.');
   }
 
   return key;
@@ -277,7 +281,7 @@ function currentDate(now) {
   const value = now();
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
   if (Number.isNaN(date.getTime())) {
-    log('The OAuth callback clock is invalid.');
+    fail(500, 'The OAuth callback clock is invalid.');
   }
 
   return date;
@@ -286,7 +290,7 @@ function currentDate(now) {
 function expiresAt(clock, seconds) {
   const value = Number(seconds);
   if (!Number.isFinite(value) || value <= 0) {
-    log(502, 'eBay returned incomplete authorization data.');
+    fail(502, 'eBay returned incomplete authorization data.');
   }
 
   return new Date(clock.getTime() + value * 1_000).toISOString();
@@ -312,7 +316,7 @@ export function connectionRowId(userId, environment) {
 function opaqueState(req) {
   const state = queryValue(req, 'state', 512);
   if (!STATE_PATTERN.test(state)) {
-    log(400, 'The eBay authorization request is invalid.');
+    fail(400, 'The eBay authorization request is invalid.');
   }
 
   return state;
@@ -321,7 +325,7 @@ function opaqueState(req) {
 function authorizationCode(req) {
   const code = queryValue(req, 'code', 2_048);
   if (!code) {
-    log(400, 'eBay did not return an authorization code.');
+    fail(400, 'eBay did not return an authorization code.');
   }
 
   return code;
@@ -344,11 +348,11 @@ function appReturnUrl(environment, status, state = '') {
   try {
     url = new URL(raw);
   } catch {
-    error('EBAY_APP_RETURN_URL must be a valid deep-link URL.');
+    fail(500, 'EBAY_APP_RETURN_URL must be a valid deep-link URL.');
   }
 
   if (url.protocol !== 'keepflip:') {
-    error('EBAY_APP_RETURN_URL must use the KeepFlip deep-link scheme.');
+    fail(500, 'EBAY_APP_RETURN_URL must use the KeepFlip deep-link scheme.');
   }
 
   url.search = '';
@@ -398,7 +402,7 @@ async function readAndClaimState({
       failureMessage: 'KeepFlip could not validate the eBay authorization request.',
     });
   } catch {
-    error(400, 'The eBay authorization request is invalid.');
+    fail(400, 'The eBay authorization request is invalid.');
   }
 
   const ownerId = cleanText(record?.ownerId, 64);
@@ -413,7 +417,7 @@ async function readAndClaimState({
     !Number.isFinite(expiresAt) ||
     expiresAt <= clock
   ) {
-    error(400, 'The eBay authorization request is invalid.');
+    fail(400, 'The eBay authorization request is invalid.');
   }
 
   let claimed;
@@ -445,7 +449,7 @@ async function readAndClaimState({
       failureMessage: 'KeepFlip could not claim the eBay authorization request.',
     });
   } catch {
-    error(409, 'The eBay authorization request is unavailable.');
+    fail(409, 'The eBay authorization request is unavailable.');
   }
 
   const affected =
@@ -455,7 +459,7 @@ async function readAndClaimState({
         ? claimed.rows.length
         : 0;
   if (affected !== 1) {
-    error(409, 'The eBay authorization request is unavailable.');
+    fail(409, 'The eBay authorization request is unavailable.');
   }
 
   return { apiKey, ownerId, stateRowId, environment: recordEnvironment };
@@ -512,7 +516,7 @@ function parseTokenResponse(payload) {
     try {
       return JSON.parse(payload);
     } catch {
-      error(502, 'eBay returned an invalid authorization response.');
+      fail(502, 'eBay returned an invalid authorization response.');
     }
   }
 
@@ -532,16 +536,13 @@ async function exchangeAuthorizationCode({
     const parsed = parseTokenResponse(payload);
 
     if (parsed.error) {
-      error(parsed.error_description || parsed.error);
+      fail(502, 'eBay did not authorize the connection.');
     }
 
     return parsed;
   } catch (caught) {
     if (caught instanceof CallbackError) throw caught;
-    error(
-      502,
-      'KeepFlip could not exchange the eBay authorization.',
-    );
+    fail(502, 'KeepFlip could not exchange the eBay authorization.');
   }
 }
 
@@ -552,7 +553,7 @@ function tokenBundleFromResponse({ payload, configuration, now }) {
     typeof payload?.refresh_token !== 'string' ||
     !payload.refresh_token
   ) {
-    error(502, 'eBay returned incomplete authorization data.');
+    fail(502, 'eBay returned incomplete authorization data.');
   }
 
   const clock = currentDate(now);
@@ -601,6 +602,9 @@ async function saveConnection({
     ),
     revokedAt: null,
     updatedAt: tokenBundle.updatedAt,
+    // This is the existing required Appwrite column spelling. Keep it until a
+    // database migration can safely replace it with a correctly named field.
+    envionment: configuration.environment,
   };
 
   const rowId = connectionRowId(ownerId, configuration.environment);
@@ -618,7 +622,7 @@ async function saveConnection({
     return;
   } catch (caught) {
     if (!(caught instanceof UpstreamError && caught.status === 409)) {
-      error(500, 'KeepFlip could not save the eBay connection.');
+      fail(500, 'KeepFlip could not save the eBay connection.');
     }
   }
 
@@ -633,13 +637,14 @@ async function saveConnection({
       failureMessage: 'KeepFlip could not save the eBay connection.',
     });
   } catch {
-    error(500, 'KeepFlip could not save the eBay connection.');
+    fail(500, 'KeepFlip could not save the eBay connection.');
   }
 }
 
 async function handleCallback({
   req,
   res,
+  log,
   error,
   declinedPath,
   fetchImpl,
@@ -705,6 +710,9 @@ async function handleCallback({
       tokenBundle,
       randomBytesImpl,
     });
+    if (typeof log === 'function') {
+      log('KeepFlip eBay OAuth connection saved.');
+    }
 
     const marked = await markState({
       fetchImpl,
@@ -758,10 +766,10 @@ export function createHandler({
   ebayAuthTokenFactory = (configuration) => createEbayClient(configuration),
 } = {}) {
   if (typeof fetchImpl !== 'function') {
-    error('A fetch implementation is required.');
+    fail(500, 'A fetch implementation is required.');
   }
 
-  return async function main({ req, res, error } = {}) {
+  return async function main({ req, res, log, error } = {}) {
     const path = requestPath(req);
     const route = callbackRoute(path);
 
@@ -785,6 +793,7 @@ export function createHandler({
       return await handleCallback({
         req,
         res,
+        log,
         error,
         declinedPath: route === 'declined',
         fetchImpl,
