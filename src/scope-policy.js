@@ -4,6 +4,7 @@ export const KEEPFLIP_EBAY_USER_SCOPES = Object.freeze([
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
   'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.finances',
+  'https://api.ebay.com/oauth/api_scope/sell.fulfillment',
 ]);
 
 export function enforceKeepFlipEbayUserScopes(environment = process.env) {
